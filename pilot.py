@@ -47,6 +47,11 @@ COSTS_AUTO = {
 }
 
 # Traversal cost table for "short" mode: attempts the Short Route first, falls back to Long Route on reset
+PURSUIT_LOOKAHEAD = 0.7  # Pure-pursuit lookahead along the cell path [m] (sets how wide corners are cut)
+TURN_DECIDE_DIST = 0.9  # Pick the next cell this far before the centre of a plain corner cell [m]
+LAT_ACC_MAX = 0.6  # Max sideways acceleration in a curve v^2 * kappa [m/s^2] (0.3 on ice)
+SLALOM_HOLD_U = -0.10  # Pelvis position along the corridor [m] while strafing across a slalom gap (gap is |u| < 0.30)
+
 COSTS_SHORT = {
     CELL_UNKNOWN: 1.05,  # Unexplored cell cost
     CELL_PLAIN: 1.0,  # Plain cell cost
@@ -75,7 +80,15 @@ class Pilot:
         self.num_envs = num_envs  # Store number of environments
         self.num_cells = num_cells  # Store grid size N
         self.cell_size = cell_size  # Store cell size (2.0 m)
+        # All pilot math runs on the CPU: hundreds of small ops + .item() calls per step cost ~27 ms on CUDA
+        # (GPU syncs) vs a few ms on CPU. Observations are copied to the CPU once per step, commands copied back.
+        self.out_device = device  # Device the simulator expects the command tensor on
+        device = "cpu"  # Internal compute device
         self.device = device  # Store compute device string
+        self.sense_every = 3  # Re-scan walls/hazards every 3 policy steps (robot moves ~3 cm in between)
+        self._step = 0  # Policy step counter for sensing decimation
+        self._walls_now = None  # Last sensed walls of the current cell (N, 4)
+        self._ff_cache = None  # (walls, costs, dist) of the last weighted flood fill
         self.start_cell = tuple(int(v) for v in start_cell)  # Normalize start cell to (int, int) tuple
         self.goal_cell = (  # Default goal to top-right corner (N-1, N-1) if not provided
             (num_cells - 1, num_cells - 1) if goal_cell is None else tuple(int(v) for v in goal_cell)
@@ -83,7 +96,7 @@ class Pilot:
 
         mode = os.environ.get("PILOT_MODE", "auto").lower()  # Read route preference mode from env var
         self.cost_table = COSTS_SHORT if mode == "short" else COSTS_AUTO  # Pick cost table for mode
-        self.fast_speed = float(os.environ.get("PILOT_SPEED", 0.85))  # Cruise speed on clear straight cells [m/s]
+        self.fast_speed = float(os.environ.get("PILOT_SPEED", 1.0))  # Cruise speed on clear straight cells [m/s]
         self.safe_lane_offset = 0.48  # Lateral offset [m] placing robot in the middle of the ~0.98 m free lane
 
         # Instantiate the underlying MazeAutopilot for basic grid indexing and wall-scan helpers
@@ -118,6 +131,10 @@ class Pilot:
         self.cell_deaths = torch.zeros(
             (num_envs, num_cells, num_cells), dtype=torch.float32, device=device
         )
+        # Extra cost from anti-stuck events (N_env, N, N) -- kept separate so re-classification does not erase it
+        self.cell_penalty = torch.zeros(
+            (num_envs, num_cells, num_cells), dtype=torch.float32, device=device
+        )
         # Corridor orientation axis for each cell: 0 = along X, 1 = along Y, -1 = unknown/corner
         self.cell_axis = torch.full(
             (num_envs, num_cells, num_cells), -1, dtype=torch.long, device=device
@@ -139,11 +156,16 @@ class Pilot:
         start_t = torch.tensor(self.start_cell, dtype=torch.long, device=device)  # Start cell tensor (2,)
         self.last_cell = start_t.repeat(num_envs, 1)  # Last cell occupied by each robot (N, 2)
         self.last_target = start_t.repeat(num_envs, 1)  # Last target cell of each robot (N, 2)
+        self.decided_tgt_type = torch.zeros(num_envs, dtype=torch.long, device=device)  # Target hazard type when chosen
         self.pos_anchor = self.ap.centre_of(self.last_cell)  # Reference XY position for stuck detection (N, 2)
         self.anchor_time = torch.zeros(num_envs, dtype=torch.float32, device=device)  # Time when anchor was updated
         self.unstuck_until = torch.full((num_envs,), -1.0, dtype=torch.float32, device=device)  # End time of unstuck maneuver
         self.unstuck_dir = torch.ones(num_envs, dtype=torch.float32, device=device)  # Alternating +1/-1 turn direction
         self.last_wp = self.ap.centre_of(self.last_cell)  # Latest continuous sub-waypoint XY for visualization (N, 2)
+        self.prev_heading = torch.zeros(num_envs, dtype=torch.long, device=device)  # Heading before the last decision
+        self.on_curve = torch.zeros(num_envs, dtype=torch.bool, device=device)  # True while pure pursuit tracks a turn
+        self.strafe = torch.zeros(num_envs, dtype=torch.bool, device=device)  # True while strafing across a slalom gap
+        self.strafe_yaw = torch.zeros(num_envs, dtype=torch.float32, device=device)  # Corridor heading held while strafing
         self.sim_time = 0.0  # Latest elapsed simulation time [s]
 
     # ------------------------------------------------------------------
@@ -238,10 +260,17 @@ class Pilot:
             same_slice_sym = (q_nn >= 2 and q_np >= 2) or (q_pn >= 2 and q_pp >= 2) or (mid_vn >= 1 and mid_vp >= 1)
             if same_slice_sym and min(tot_vn, tot_vp) >= 2:
                 # Do not overwrite an already confirmed slalom cell
-                if int(self.cell_type[env_id, ci, cj].item()) != CELL_SPIKE_SLALOM:
-                    # Use 90th percentile height to distinguish Steep Ramp (0.24-0.30 m) from Low Ramp (0.10-0.18 m)
-                    z_max = float(torch.quantile(z_e, 0.90).item()) if len(z_e) >= 4 else float(z_e.max().item())
+                prev_type = int(self.cell_type[env_id, ci, cj].item())  # Existing classification
+                if prev_type != CELL_SPIKE_SLALOM:
+                    top_seen = int((torch.abs(u) < 0.20).sum().item()) >= 3  # Flat top (|u| <= 0.25) is in view
+                    if top_seen:
+                        # Use 90th percentile height to distinguish Steep Ramp (0.24-0.30 m) from Low Ramp (0.10-0.18 m)
+                        z_max = float(torch.quantile(z_e, 0.90).item()) if len(z_e) >= 4 else float(z_e.max().item())
+                    else:
+                        z_max = self._ramp_height_from_slope(u, z)  # Only a slope is visible: extrapolate to the top
                     ramp_kind = CELL_STEEP_RAMP if z_max > 0.205 else CELL_LOW_RAMP  # Threshold at 0.205 m
+                    if prev_type == CELL_STEEP_RAMP and not top_seen:
+                        ramp_kind = CELL_STEEP_RAMP  # Never downgrade a steep ramp from a partial view
                     self.safe_offset[env_id, ci, cj] = 0.0  # Ramps span full width -> walk down centerline (0.0)
                     self._set_cell_hazard(env_id, ci, cj, ramp_kind)  # Record STEEP_RAMP or LOW_RAMP
                 return  # Done classifying this cell
@@ -291,11 +320,28 @@ class Pilot:
             elif int(self.cell_type[env_id, ci, cj].item()) == CELL_UNKNOWN:  # Flat at z = 0 -> plain floor
                 self._set_cell_hazard(env_id, ci, cj, CELL_PLAIN)  # Mark cell as PLAIN
 
+    @staticmethod
+    def _ramp_height_from_slope(u: torch.Tensor, z: torch.Tensor) -> float:
+        """Estimate ramp height from slope rays only: fit z = a + b * |u| and evaluate at the top edge |u| = 0.25."""
+        au = torch.abs(u)  # Distance from cell center along corridor [m]
+        on_slope = (au > 0.30) & (au < 0.95) & (z > 0.005) & (z < 0.42)  # Rays on the slope (not floor or walls)
+        if int(on_slope.sum().item()) < 6:  # Too few slope rays for a line fit
+            return float(z[on_slope].max().item()) if bool(on_slope.any()) else 0.0
+        x, y = au[on_slope], z[on_slope]  # Slope samples (|u|, z)
+        x_mean, y_mean = x.mean(), y.mean()  # Means for least squares
+        var = ((x - x_mean) ** 2).sum()  # Spread of |u|
+        if float(var.item()) < 1e-6:  # All rays at one |u| (a single row): cannot fit a slope
+            return float(y.max().item())
+        slope = ((x - x_mean) * (y - y_mean)).sum() / var  # dz / d|u| (negative on a ramp)
+        return float((y_mean + slope * (0.25 - x_mean)).item())  # Height at the top edge |u| = 0.25 m
+
     def _set_cell_hazard(self, env_id: int, ci: int, cj: int, hazard_type: int):
         """Update cell classification and recompute its traversal cost (base cost + death penalty)."""
         self.cell_type[env_id, ci, cj] = hazard_type  # Store integer hazard category
         base_cost = self.cost_table[hazard_type]  # Look up base traversal cost for this hazard type
-        self.cell_cost[env_id, ci, cj] = base_cost + 50.0 * self.cell_deaths[env_id, ci, cj]  # Add reset penalty
+        self.cell_cost[env_id, ci, cj] = (  # Add reset penalty and anti-stuck penalty
+            base_cost + 50.0 * self.cell_deaths[env_id, ci, cj] + self.cell_penalty[env_id, ci, cj]
+        )
 
     def _scan_walls_with_coverage(
         self,
@@ -429,6 +475,9 @@ class Pilot:
     # ------------------------------------------------------------------
     def weighted_flood_fill(self, walls: torch.Tensor) -> torch.Tensor:
         """Compute minimum cumulative traversal cost from every cell to goal_cell via Bellman-Ford."""
+        c = self._ff_cache  # Reuse the last result while walls and costs are unchanged
+        if c is not None and torch.equal(c[0], walls) and torch.equal(c[1], self.cell_cost):
+            return c[2]
         n = self.num_cells  # Grid dimension N
         big = 1e6  # Infinity cost for unreachable/blocked transitions
         dist = torch.full((walls.shape[0], n, n), big, dtype=torch.float32, device=self.device)  # Init cost-to-goal
@@ -461,6 +510,7 @@ class Pilot:
             if torch.allclose(new, dist):  # Stop early once fixed point is reached
                 break
             dist = new  # Update cost-to-goal tensor
+        self._ff_cache = (walls.clone(), self.cell_cost.clone(), dist)  # Remember inputs and result
         return dist  # Return (N_env, n, n) cumulative cost-to-goal
 
     def choose_direction(
@@ -496,9 +546,11 @@ class Pilot:
         ctype = int(self.cell_type[env_id, ci, cj].item())  # Hazard type of current cell
         ttype = int(self.cell_type[env_id, ti, tj].item())  # Hazard type of target cell
 
-        wp = self.ap.centre_of(self.ap.target[env_id]).clone()  # Default waypoint is center of target cell
+        default_wp, curve = self._pursuit_point(env_id, pos)  # Default waypoint: lookahead point on the cell path
+        wp = default_wp.clone()  # Hazard cases below may replace it
         speed = self.fast_speed  # Default max speed is fast cruise speed (0.85 m/s)
         vy_bias = 0.0  # Default lateral velocity bias is 0.0 m/s
+        self.strafe[env_id] = False  # Normal waypoint tracking unless the slalom crossover below turns it on
 
         # Determine travel direction vector and sign (+1 or -1) along the corridor
         h_dir = int(self.ap.heading[env_id].item())  # Current travel direction (0..3)
@@ -533,14 +585,20 @@ class Pilot:
                 v_entry = v_neg if travel_sign > 0 else v_pos  # Safe lane for entry half
                 v_exit = v_pos if travel_sign > 0 else v_neg  # Safe lane for exit half
 
-                if u_rel < -0.22:  # Stage 1: before the central gap -> stay in entry safe lane
-                    u_aim = -0.10 * travel_sign  # Aim just inside the central gap
+                aligned = abs(v_world - v_exit) <= 0.15  # Already in the exit safe lane
+                # Pelvis target inside the 0.6 m gap (|u| < 0.30): the bent knees sit 0.21-0.32 m AHEAD of the pelvis
+                # (below the 0.37 m spike-hit height), so hold the pelvis behind the gap centre
+                u_hold = SLALOM_HOLD_U
+                if u_rel < u_hold - 0.06 and not aligned:  # Stage 1: walk to the gap in the entry safe lane
+                    u_aim = u_hold * travel_sign  # Stop where knees and heels both fit inside the gap
                     v_aim = v_entry  # Hold entry safe lane offset
-                    speed = 0.42  # Cautious speed approaching crossover gap
-                elif abs(v_world - v_exit) > 0.18 and u_rel < 0.25:  # Stage 2: inside the 0.6 m crossover gap
-                    u_aim = 0.05 * travel_sign  # Stay centered in the gap longitudinally
+                    speed = 0.42 if u_rel < -0.55 else 0.28  # Slow down near the gap so momentum does not carry past it
+                elif not aligned and u_rel < 0.95:  # Stage 2: strafe sideways across the 0.6 m gap
+                    u_aim = u_hold * travel_sign  # Hold the pelvis behind the gap centre (back off if it drifted on)
                     v_aim = v_exit  # Shift laterally across to the exit safe lane
-                    speed = 0.35  # Slow down during lateral lane change
+                    speed = 0.0  # No forward walking: act() strafes with v_y while facing down the corridor
+                    self.strafe[env_id] = True  # Holonomic strafe instead of turning toward the waypoint
+                    self.strafe_yaw[env_id] = math.atan2(float(dj), float(di))  # Hold the corridor travel heading
                 else:  # Stage 3: aligned with exit safe lane -> walk straight out past second bed (+0.90 m)
                     u_aim = 0.95 * travel_sign  # Aim past exit border of slalom cell
                     v_aim = v_exit  # Hold exit safe lane offset
@@ -575,7 +633,9 @@ class Pilot:
             speed = min(speed, 0.68)  # Balanced speed over loose boxes and low ramps
 
         # Local point-cloud repulsion shield: push robot away from any spike cones close to the body
-        if ctype in (CELL_SPIKE_LANE, CELL_SPIKE_SLALOM) or ttype in (CELL_SPIKE_LANE, CELL_SPIKE_SLALOM):
+        # (not inside a slalom cell: there the second bed is straight ahead by design and the stage logic handles it)
+        near_spikes = ctype in (CELL_SPIKE_LANE, CELL_SPIKE_SLALOM) or ttype in (CELL_SPIKE_LANE, CELL_SPIKE_SLALOM)
+        if near_spikes and ctype != CELL_SPIKE_SLALOM:
             rel_xy = scan_xy - pos.unsqueeze(0)  # Scan points relative to robot base (R, 2)
             c_yaw, s_yaw = math.cos(yaw), math.sin(yaw)  # Cosine and sine of robot yaw
             rx = rel_xy[:, 0] * c_yaw + rel_xy[:, 1] * s_yaw  # Forward distance in robot frame [m]
@@ -587,20 +647,78 @@ class Pilot:
                 vy_bias = -0.22 if mean_ry > 0.0 else 0.22  # Sidestep away from the cones
                 speed = min(speed, 0.38)  # Slow forward speed while sidestepping away
 
+        self.on_curve[env_id] = curve and bool(torch.equal(wp, default_wp))  # Curve only if no hazard override
         return wp, speed, vy_bias  # Return target waypoint (2,), speed limit, and lateral velocity bias
+
+    def _pursuit_point(self, env_id: int, pos: torch.Tensor) -> tuple[torch.Tensor, bool]:
+        """Pure-pursuit lookahead point on the cell path previous centre -> origin centre -> target centre.
+
+        After a turn decision (made ~0.9 m before the corner cell's centre) the path bends at the corner cell's
+        centre; aiming ``PURSUIT_LOOKAHEAD`` ahead along it walks the corner as a smooth arc instead of braking at
+        the centre. Returns (point (2,), True if the path bends here). U-turns keep the old target-centre waypoint.
+        """
+        target_c = self.ap.centre_of(self.ap.target[env_id])  # Centre of the cell we walk to
+        h, ph = int(self.ap.heading[env_id].item()), int(self.prev_heading[env_id].item())  # New / previous heading
+        corner = (h - ph) % 4 in (1, 3) and not bool((self.ap.origin[env_id] == self.ap.target[env_id]).all())
+        oi, oj = int(self.ap.origin[env_id, 0].item()), int(self.ap.origin[env_id, 1].item())
+        on_ice = int(self.cell_type[env_id, oi, oj].item()) == CELL_ICE  # Corner cell is ice (mu = 0.2)
+        if not corner or on_ice:  # Straight on, U-turn, start, or an ice corner: aim at the target centre as before
+            return target_c, False
+        corner_c = self.ap.centre_of(self.ap.origin[env_id])  # Centre of the corner cell (decision cell)
+        prev_c = corner_c - self.ap._dirs[ph].float() * self.cell_size  # Centre of the cell before the corner
+        pts = [prev_c, corner_c, target_c]  # Polyline of the path through the corner
+        best_s, best_d, acc = 0.0, 1e9, 0.0  # Arc length of the closest point on the polyline
+        for a, b in zip(pts[:-1], pts[1:]):
+            seg = b - a
+            length = float(torch.linalg.norm(seg).item())
+            t = float(((pos - a) * seg).sum().item()) / (length * length)
+            t = min(max(t, 0.0), 1.0)
+            d = float(torch.linalg.norm(a + t * seg - pos).item())
+            if d < best_d:
+                best_d, best_s = d, acc + t * length
+            acc += length
+        s = best_s + PURSUIT_LOOKAHEAD  # Lookahead arc length
+        for a, b in zip(pts[:-1], pts[1:]):  # Walk the polyline to arc length s
+            length = float(torch.linalg.norm(b - a).item())
+            if s <= length:
+                return a + (b - a) * (s / length), True
+            s -= length
+        return target_c, True  # Past the end: the target centre
+
+    @staticmethod
+    def _side_away_from_cones(pos: torch.Tensor, yaw: float, scan_xy: torch.Tensor, scan_z: torch.Tensor) -> float:
+        """Robot-frame lateral sign (+1 left / -1 right) pointing away from spike cones within 1.2 m, 0.0 if none."""
+        rel_xy = scan_xy - pos.unsqueeze(0)  # Scan points relative to robot base (R, 2)
+        c_yaw, s_yaw = math.cos(yaw), math.sin(yaw)  # Cosine and sine of robot yaw
+        ry = -rel_xy[:, 0] * s_yaw + rel_xy[:, 1] * c_yaw  # Lateral distance in robot frame (+left, -right) [m]
+        near = torch.linalg.norm(rel_xy, dim=1) < 1.2  # Points close enough to matter for a 1.2 s maneuver
+        cones = near & (scan_z > 0.14) & (scan_z < 0.42) & (torch.abs(ry) > 0.05)  # Cone-height points to the side
+        if int(cones.sum().item()) < 2:  # No spike bed beside the robot
+            return 0.0
+        return -1.0 if float(ry[cones].mean().item()) > 0.0 else 1.0  # Opposite side of the cones
 
     # ------------------------------------------------------------------
     # 4. Main Step & Anti-Stuck Reflex
     # ------------------------------------------------------------------
     def act(self, obs: dict) -> torch.Tensor:
         """Compute velocity command (num_envs, 3) -> [v_x, v_y, w_z] in robot frame."""
+        # One copy of every observation tensor to the CPU (see __init__); everything below runs there
+        obs = {k: (v.detach().to(self.device) if torch.is_tensor(v) else v) for k, v in obs.items()}
         pos_xy = obs["pos_xy"]  # Current robot XY positions in maze frame (N, 2)
         yaw = obs["yaw"]  # Current robot yaw headings in maze frame (N,)
         dt = float(obs["dt"])  # Policy step timestep (0.02 s)
         self.sim_time = float(obs.get("t", self.sim_time + dt))  # Current elapsed simulation time [s]
 
         cell = self.ap.cell_of(pos_xy)  # Current grid cell (i, j) of each robot (N, 2)
-        walls_now = self.sense_environment(obs, cell)  # Update wall map and classify hazards in view
+        # Re-scan every `sense_every` steps, and always when the robot enters a new cell or needs a decision
+        new_cell = not torch.equal(cell, self.last_cell)
+        if self._walls_now is None or new_cell or bool(self.ap.need_decision.any()) or self._step % self.sense_every == 0:
+            self._walls_now = self.sense_environment(obs, cell)  # Update wall map and classify hazards in view
+        else:  # In between: the remembered walls of the current cell
+            env_arange = torch.arange(self.num_envs, device=self.device)
+            self._walls_now = self.ap.walls[env_arange, cell[:, 0], cell[:, 1]] == 1
+        self._step += 1
+        walls_now = self._walls_now
         self.last_cell = cell.clone()  # Record current cell for failure attribution if a reset occurs
 
         # Use a tight turn radius (0.22 m) near spikes/trenches so the robot never cuts corners into hazards
@@ -621,13 +739,25 @@ class Pilot:
         u_along = (rel_centre * dir_vec).sum(dim=1)  # Signed longitudinal position in cell [-1.0, +1.0]
         in_spike_cell = (cur_type == CELL_SPIKE_LANE) | (cur_type == CELL_SPIKE_SLALOM)
         near_spike_mid = in_spike_cell & (torch.abs(u_along) < 0.30)  # Passing longitudinal center in safe lane
-        near_centre = (torch.linalg.norm(rel_centre, dim=1) < turn_radius) | near_spike_mid
+        past_centre = u_along > 0.0  # Already beyond the target centre (e.g. after a slip or wide arc)
+        # Early decision in plain cells (so the turn can be walked as a curve): ~0.9 m before the centre, close to the
+        # centreline, and only once the three sides ahead are known (unknown sides are never chosen as open)
+        env_ar = torch.arange(self.num_envs, device=self.device)
+        cell_walls = self.ap.walls[env_ar, cell[:, 0], cell[:, 1]]  # (N, 4) walls of the current cell
+        back = (self.ap.heading + 2) % 4  # Side we came in through
+        ahead_known = ((cell_walls != -1) | (torch.arange(4, device=self.device).unsqueeze(0) == back.unsqueeze(1))).all(dim=1)
+        lateral = torch.abs(rel_centre[:, 0] * dir_vec[:, 1] - rel_centre[:, 1] * dir_vec[:, 0])  # Off-centreline [m]
+        early = (
+            ~cautious_cell & (cur_type != CELL_ICE) & ahead_known & (u_along > -TURN_DECIDE_DIST) & (lateral < 0.45)
+        )
+        near_centre = (torch.linalg.norm(rel_centre, dim=1) < turn_radius) | near_spike_mid | past_centre | early
         arrived = near_centre & (cell == self.ap.target).all(dim=1)  # Arrived at target cell decision point
 
         # Re-evaluate direction if a newly sensed wall blocks our heading OR a hard hazard is spotted ahead
         still_there = (cell == self.ap.origin).all(dim=1) & ~self.ap.need_decision
         surprise = still_there & walls_now.gather(1, self.ap.heading.unsqueeze(1)).squeeze(1)
-        hazard_surprise = still_there & (tgt_type >= CELL_SPIKE_SLALOM)  # Spotted slalom/trench/steep ramp ahead
+        # Spotted slalom/trench/steep ramp ahead that the last decision did not know about (replan once, not every step)
+        hazard_surprise = still_there & (tgt_type >= CELL_SPIKE_SLALOM) & (tgt_type != self.decided_tgt_type)
 
         decide = self.ap.need_decision | arrived | surprise | hazard_surprise  # Envs needing a planner update
         if decide.any():
@@ -636,11 +766,15 @@ class Pilot:
             d = self.choose_direction(cell[idx], open_sides, self.ap.heading[idx])  # Run Weighted Dijkstra
             moved = ~self.ap.need_decision[idx] & ~surprise[idx] & ~hazard_surprise[idx]  # True if advanced a cell
             self.ap.cells_walked[idx] += moved.long()  # Increment cells walked counter
+            # Heading we arrived with (for the corner curve); a replan in the same cell keeps the original one
+            self.prev_heading[idx] = torch.where(moved | self.ap.need_decision[idx], self.ap.heading[idx], self.prev_heading[idx])
             self.ap.heading[idx] = d  # Update chosen travel direction
             self.ap.target[idx] = (cell[idx] + self.ap._dirs[d]).clamp(0, self.num_cells - 1)  # Next target cell
             self.ap.origin[idx] = cell[idx]  # Record decision origin cell
             self.ap.need_decision[idx] = False  # Clear decision flag
             self.last_target[idx] = self.ap.target[idx]  # Save target cell for reset attribution
+            # Remember the hazard type of the chosen target cell at decision time
+            self.decided_tgt_type[idx] = self.cell_type[idx, self.ap.target[idx, 0], self.ap.target[idx, 1]]
 
         # Anti-stuck reflex: check if robot has progressed at least 0.28 m within the last 3.5 seconds
         moved_dist = torch.linalg.norm(pos_xy - self.pos_anchor, dim=1)  # Distance from anchor position
@@ -654,11 +788,14 @@ class Pilot:
         if stuck_now.any():
             for b in torch.nonzero(stuck_now).squeeze(1).tolist():  # Handle each stuck robot
                 self.unstuck_until[b] = self.sim_time + 1.2  # Back up and turn for 1.2 seconds
-                self.unstuck_dir[b] = -self.unstuck_dir[b]  # Flip turn/strafe direction from last attempt
+                away = self._side_away_from_cones(pos_xy[b], float(yaw[b].item()), obs["scan_xy"][b], obs["scan_z"][b])
+                # Strafe/turn away from nearby spike cones; flip from the last attempt only when none are near
+                self.unstuck_dir[b] = away if away != 0.0 else -self.unstuck_dir[b]
                 self.pos_anchor[b] = pos_xy[b]  # Reset anchor position
                 self.anchor_time[b] = self.sim_time  # Reset anchor time
                 ti, tj = int(self.ap.target[b, 0].item()), int(self.ap.target[b, 1].item())  # Blocking target cell
                 if (ti, tj) != self.start_cell and (ti, tj) != self.goal_cell:
+                    self.cell_penalty[b, ti, tj] += 15.0  # Remember penalty (survives re-classification)
                     self.cell_cost[b, ti, tj] += 15.0  # Penalize blocking cell so planner considers alternatives
                 self.ap.need_decision[b] = True  # Replan immediately after unstuck maneuver
 
@@ -686,20 +823,39 @@ class Pilot:
             c_yaw, s_yaw = math.cos(float(yaw[b].item())), math.sin(float(yaw[b].item()))
             lat_err_b = -float(to_wp[0].item()) * s_yaw + float(to_wp[1].item()) * c_yaw
 
-            cos_err = max(math.cos(yaw_err), 0.0)  # Scale forward speed by cos^2(yaw_err)
-            v_des = self.ap.min_speed + (max_spd - self.ap.min_speed) * (cos_err**2)
-            if abs(yaw_err) > 0.7:  # Slow to min_speed when a large heading change is required
-                v_des = self.ap.min_speed
+            if bool(self.strafe[b].item()):  # Slalom crossover: face down the corridor and step sideways
+                fwd_err_b = float(to_wp[0].item()) * c_yaw + float(to_wp[1].item()) * s_yaw  # Waypoint ahead [m]
+                head_err = float(self.strafe_yaw[b].item()) - float(yaw[b].item())  # Error to corridor heading
+                head_err = math.atan2(math.sin(head_err), math.cos(head_err))  # Wrap to [-pi, pi]
+                v_des = max(min(0.8 * fwd_err_b, 0.12), -0.15)  # Hold the gap centre longitudinally
+                vy_des = max(min(1.2 * lat_err_b, 0.35), -0.35)  # Strafe toward the exit lane (trained |v_y| <= 0.35)
+                w_des = max(min(1.6 * head_err, self.ap.max_turn), -self.ap.max_turn)  # Keep facing the corridor
+            else:
+                on_ice = int(self.cell_type[b, cell[b, 0], cell[b, 1]].item()) == CELL_ICE
+                curve = bool(self.on_curve[b].item())
+                if curve and abs(yaw_err) < 1.2:
+                    # Pure pursuit: curvature to the lookahead point sets the speed (v^2 * kappa <= LAT_ACC_MAX)
+                    d_wp = max(float(torch.linalg.norm(to_wp).item()), 0.3)
+                    kappa = 2.0 * abs(math.sin(yaw_err)) / d_wp
+                    a_lat = 0.5 * LAT_ACC_MAX if on_ice else LAT_ACC_MAX
+                    v_des = min(max_spd, math.sqrt(a_lat / max(kappa, 1e-3)))
+                    v_des = max(v_des, self.ap.min_speed)
+                else:
+                    cos_err = max(math.cos(yaw_err), 0.0)  # Scale forward speed by cos^2(yaw_err)
+                    v_des = self.ap.min_speed + (max_spd - self.ap.min_speed) * (cos_err**2)
+                    if abs(yaw_err) > 0.7:  # Slow to min_speed when a large heading change is required
+                        v_des = self.ap.min_speed
 
-            # Limit yaw rate on slippery ice cells to prevent spinning out
-            max_w = 0.65 if int(self.cell_type[b, cell[b, 0], cell[b, 1]].item()) == CELL_ICE else self.ap.max_turn
-            w_des = max(min(1.6 * yaw_err, max_w), -max_w)  # Proportional yaw rate controller
+                # Limit yaw rate on slippery ice cells to prevent spinning out
+                max_w = 0.65 if on_ice else self.ap.max_turn
+                w_des = max(min(1.6 * yaw_err, max_w), -max_w)  # Proportional yaw rate controller
 
-            # Apply gentle lateral strafing (v_y) when roughly aligned with the corridor
-            vy_des = vy_bias  # Start with spike-repulsion bias
-            if abs(yaw_err) < 0.45:  # Add proportional lateral lane-tracking velocity
-                vy_des += max(min(0.45 * lat_err_b, 0.22), -0.22)
-            vy_des = max(min(vy_des, 0.28), -0.28)  # Clamp total lateral velocity command
+                # Apply gentle lateral strafing (v_y) when roughly aligned with the corridor (not in a curve:
+                # the lookahead point sits inside the corner and v_y would crab the robot toward the inner wall)
+                vy_des = vy_bias  # Start with spike-repulsion bias
+                if abs(yaw_err) < 0.45 and not curve:  # Add proportional lateral lane-tracking velocity
+                    vy_des += max(min(0.45 * lat_err_b, 0.22), -0.22)
+                vy_des = max(min(vy_des, 0.28), -0.28)  # Clamp total lateral velocity command
 
             # Apply acceleration rate limits for smooth locomotion commands
             acc = 0.6 if int(self.cell_type[b, cell[b, 0], cell[b, 1]].item()) == CELL_ICE else self.ap.max_acc
@@ -709,7 +865,7 @@ class Pilot:
             self.ap.cmd[b, 2] += max(min(w_des - float(self.ap.cmd[b, 2].item()), ang_acc * dt), -ang_acc * dt)
             out_cmd[b] = self.ap.cmd[b]  # Copy smoothed command to output tensor
 
-        return out_cmd  # Return (N, 3) velocity commands [v_x, v_y, w_z]
+        return out_cmd.to(self.out_device)  # Return (N, 3) velocity commands [v_x, v_y, w_z] on the sim device
 
     def reset(self, env_ids: torch.Tensor):
         """Called when the robot falls, hits a spike bed, or gets stuck and resets to start.
@@ -717,6 +873,7 @@ class Pilot:
         Preserves the discovered wall and hazard maps and penalizes the cell where the failure occurred
         so the planner automatically switches routes on the next attempt.
         """
+        env_ids = torch.as_tensor(env_ids).to(self.device)  # Indices may arrive on the sim device
         for b in env_ids.tolist():  # Attribute failure to the cell where the robot just reset
             ci, cj = int(self.last_cell[b, 0].item()), int(self.last_cell[b, 1].item())  # Last occupied cell
             ti, tj = int(self.last_target[b, 0].item()), int(self.last_target[b, 1].item())  # Last target cell
@@ -732,11 +889,14 @@ class Pilot:
         self.ap.target[env_ids] = start  # Reset current target to start cell
         self.ap.origin[env_ids] = start  # Reset decision origin to start cell
         self.ap.heading[env_ids] = 0  # Reset initial heading to +X (East)
+        self.prev_heading[env_ids] = 0  # No corner curve on the first step after respawn
+        self._walls_now = None  # Force a full scan on the first step after respawn
         self.ap.need_decision[env_ids] = True  # Force direction decision on first step after respawn
         self.ap.cells_walked[env_ids] = 0  # Reset cells walked counter for this attempt
         self.ap.cmd[env_ids] = 0.0  # Zero velocity commands
         self.last_cell[env_ids] = start  # Reset last cell tracker
         self.last_target[env_ids] = start  # Reset last target tracker
+        self.decided_tgt_type[env_ids] = CELL_UNKNOWN  # Forget the hazard type of the old target
         self.pos_anchor[env_ids] = self.ap.centre_of(start)  # Reset anti-stuck position anchor
         self.last_wp[env_ids] = self.ap.centre_of(start)  # Reset visualized waypoint to start cell center
         self.anchor_time[env_ids] = self.sim_time  # Reset anti-stuck timer

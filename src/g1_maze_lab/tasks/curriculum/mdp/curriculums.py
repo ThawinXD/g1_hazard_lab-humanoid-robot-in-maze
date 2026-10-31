@@ -15,6 +15,7 @@ term                           what it changes
 RewardWeightRampCurriculum     a reward weight, linearly between two training steps
 AdaptivePushCurriculum         push strength, up when few robots fall, down when many fall
 CommandRangeCurriculum         the max forward speed command, up when tracking is good
+terrain_levels_skill           terrain difficulty, like ``terrain_levels_vel`` but for turning commands
 =============================  ==================================================================
 
 Every term is called by the curriculum manager **when environments reset** (``env_ids`` = the robots
@@ -30,7 +31,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from isaaclab.managers import CurriculumTermCfg, ManagerTermBase
+import torch
+
+from isaaclab.managers import CurriculumTermCfg, ManagerTermBase, SceneEntityCfg
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -157,3 +160,43 @@ class CommandRangeCurriculum(ManagerTermBase):
                 self._ranges.lin_vel_x = (lo, min(hi + step, final_max))
             self._sum, self._count, self._last_update = 0.0, 0, env.common_step_counter
         return self._ranges.lin_vel_x[1]
+
+
+def terrain_levels_skill(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    reward_term: str = "track_lin_vel_xy_exp",
+    fall_terms: Sequence[str] = ("base_contact",),
+    up_threshold: float = 0.75,
+    down_threshold: float = 0.5,
+    leave_distance: float = 2.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> float:
+    """Terrain curriculum for direct ``(v_x, v_y, w_z)`` commands (``heading_command = False``).
+
+    ``terrain_levels_vel`` moves a robot up only if it ends half a tile (4 m) from its spawn in a straight line,
+    and down if it covered less than half of ``|command| x episode length``. A robot that follows a random yaw-rate
+    command walks in a circle, so it almost never moves up and almost always moves down, however well it walks:
+    the levels sink to row 0. This term judges how well the robot *walked* instead:
+
+    * up:   finished the episode without falling, tracked ``reward_term`` above ``up_threshold`` x its maximum,
+            and ended more than ``leave_distance`` from its spawn (it left the platform and met the hazard ring)
+    * down: fell (any of ``fall_terms``), or tracked below ``down_threshold`` x its maximum
+    """
+    asset = env.scene[asset_cfg.name]
+    terrain = env.scene.terrain
+    if env.common_step_counter == 0 or len(env_ids) == 0:  # the very first reset at start-up is not an episode end
+        return float(torch.mean(terrain.terrain_levels.float()))
+    # episode sum / episode length = average reward per second; its maximum is the weight itself
+    weight = env.reward_manager.get_term_cfg(reward_term).weight
+    track = env.reward_manager._episode_sums[reward_term][env_ids] / env.max_episode_length_s / weight
+    fell = torch.zeros_like(track, dtype=torch.bool)
+    for name in fall_terms:
+        if name in env.termination_manager.active_terms:
+            fell |= env.termination_manager.get_term(name)[env_ids]
+    timed_out = env.termination_manager.time_outs[env_ids]
+    distance = torch.linalg.norm(asset.data.root_pos_w.torch[env_ids, :2] - env.scene.env_origins[env_ids, :2], dim=1)
+    move_up = timed_out & ~fell & (track > up_threshold) & (distance > leave_distance)
+    move_down = (fell | (track < down_threshold)) & ~move_up
+    terrain.update_env_origins(env_ids, move_up, move_down)
+    return float(torch.mean(terrain.terrain_levels.float()))

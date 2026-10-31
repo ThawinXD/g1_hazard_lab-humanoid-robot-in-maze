@@ -239,6 +239,20 @@ class G1HazardStarterEnvCfg(G1RoughEnvCfg):
         self.commands.base_velocity.ranges.lin_vel_y = (-0.35, 0.35)  # Train lateral strafing for dodging spike beds
         self.commands.base_velocity.ranges.ang_vel_z = (-1.2, 1.2)  # Train responsive yaw turns for twisty corridors
 
+        # Terrain curriculum: the default terrain_levels_vel needs straight walking (> 4 m from spawn), but random
+        # yaw-rate commands make the robots walk in circles, so levels sank to row ~0.9 (ramps <= 0.13 m).
+        # Promote on survival + good tracking + leaving the spawn platform instead.
+        self.curriculum.terrain_levels = CurrTerm(
+            func=curr_mdp.terrain_levels_skill,  # Skill-based terrain level curriculum
+            params={
+                "reward_term": "track_lin_vel_xy_exp",  # Velocity tracking reward to judge walking quality
+                "fall_terms": ("base_contact", "physics_blowup"),  # Terminations that count as a fall
+                "up_threshold": 0.75,  # Move up when tracking >= 75% of max (and no fall, left platform)
+                "down_threshold": 0.5,  # Move down when tracking < 50% of max (stuck at a ramp or trench)
+                "leave_distance": 2.0,  # Must end > 2.0 m from spawn (past the ramp crest / inner trench)
+            },
+        )
+
         # Curriculum 1: Ramp feet_air_time reward weight (0.25 -> 0.65) so feet clear trenches & boxes cleanly
         self.curriculum.feet_air_time_ramp = CurrTerm(
             func=curr_mdp.RewardWeightRampCurriculum,  # Linear reward weight ramp curriculum
