@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Challenge 7.5 starter: fine-tune G1 Rough on hazard-like ground (copy this folder and make it your own)."""
+"""Challenge 7.5 Option B training tasks: G1-Hazard-Starter and G1-Hazard-Pro."""
 
 import gymnasium as gym
 
@@ -15,5 +15,16 @@ gym.register(
         "env_cfg_entry_point": f"{__name__}.env_cfg:G1HazardStarterEnvCfg",
         "default_agent": "rsl_rl",
         "rsl_rl_cfg_entry_point": f"{__name__}.env_cfg:G1HazardStarterPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="G1-Hazard-Pro",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.env_cfg:G1HazardProEnvCfg",
+        "default_agent": "rsl_rl",
+        "rsl_rl_cfg_entry_point": f"{__name__}.env_cfg:G1HazardProPPORunnerCfg",
     },
 )
