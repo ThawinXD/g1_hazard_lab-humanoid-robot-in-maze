@@ -17,7 +17,10 @@ A run that takes longer than --timeout seconds of wall clock (a pilot that hangs
 
 import argparse
 import contextlib
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import json
 import os
 import re
@@ -36,11 +39,13 @@ SUBMISSIONS = os.environ.get("CHALLENGE_DIR", os.path.join(HERE, "..", "submissi
 def status_lock():
     """Same lock as challenge_server.py: an upload and a state change never overwrite each other."""
     with open(os.path.join(SUBMISSIONS, ".status.lock"), "w") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+        if fcntl is not None:
+            fcntl.flock(f, fcntl.LOCK_EX)
         try:
             yield
         finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def load():

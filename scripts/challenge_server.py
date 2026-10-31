@@ -17,7 +17,10 @@ Note: pilot.py runs on this machine. Use it on a classroom network only, and rea
 
 import contextlib
 import csv
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import glob
 import html
 import json
@@ -109,11 +112,13 @@ def status_lock():
     """status.json is written by this server (uploads) and by challenge_runner.py: one writer at a time."""
     os.makedirs(SUBMISSIONS, exist_ok=True)
     with open(os.path.join(SUBMISSIONS, ".status.lock"), "w") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+        if fcntl is not None:
+            fcntl.flock(f, fcntl.LOCK_EX)
         try:
             yield
         finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def load_status():
