@@ -1,0 +1,32 @@
+# Virtual environment & caches
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+**/__pycache__/
+**/*.egg-info/
+*.py[cod]
+build/
+dist/
+
+# Simulation & training outputs
+logs/
+outputs/
+videos/
+snapshots/
+frames/
+wandb/
+*.mp4
+imgui.ini
+
+# Challenge runtime files
+submissions/_logs/
+submissions/_replays/
+submissions/leaderboard.csv
+submissions/status.json*
+submissions/.status.lock
+
+# Editor configs
+.vscode/settings.json
+.vscode/launch.json
+pyrightconfig.json
