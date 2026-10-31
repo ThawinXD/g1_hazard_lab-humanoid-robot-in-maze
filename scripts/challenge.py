@@ -181,10 +181,24 @@ def route_left_m(p, cell, to_goal, walls):
     return left * CELL_SIZE
 
 
-# ----------------------------------------------------------------------------- viewer: timer + camera
+# ----------------------------------------------------------------------------- viewer: timer + camera + pilot map
 HUD = {"team": "", "seed": "", "level": "", "why": "FELL / CRASH", "t": 0.0, "left": 0, "falls": 0, "goal": None, "flash": False, "limit": TIME_LIMIT,
-       "dist": 0.0, "best": 0.0, "route": 0.0}
+       "dist": 0.0, "best": 0.0, "route": 0.0, "pilot": None, "pos_xy": (0.0, 0.0), "yaw": 0.0,
+       "show_3d_route": os.environ.get("MAZE_SHOW_ROUTE", "1") == "1",
+       "show_lidar": os.environ.get("MAZE_SHOW_LIDAR", "0") == "1",
+       "show_scan": os.environ.get("MAZE_SHOW_SCAN", "0") == "1"}
 _CAM = {"yaw": None, "follow": True, "c_down": False}
+
+_HAZARD_META = {
+    0: ("?", (24, 32, 44, 215)),
+    1: ("FLAT", (42, 58, 78, 235)),
+    2: ("ICE", (35, 130, 175, 235)),
+    3: ("RMP", (38, 130, 108, 235)),
+    4: ("SPK", (200, 68, 45, 235)),
+    5: ("SLM", (168, 52, 180, 235)),
+    6: ("TRN", (112, 55, 195, 235)),
+    7: ("STP", (200, 138, 28, 235)),
+}
 
 
 def _hud(imgui):
@@ -216,6 +230,137 @@ def _hud(imgui):
     imgui.text(f"cells to goal {HUD['left']}   falls {HUD['falls']}   limit {HUD['limit']:.0f} s")
     if HUD["flash"]:
         imgui.text_colored(orange, f"{HUD['why']} -> back to start")
+    imgui.end()
+    _draw_pilot_map(imgui)
+
+
+def _draw_pilot_map(imgui):
+    dbg = HUD.get("pilot")
+    if not dbg:
+        return
+    imgui.set_next_window_pos(imgui.ImVec2(12.0, 12.0), imgui.Cond_.first_use_ever)
+    imgui.set_next_window_bg_alpha(0.88)
+    win_flags = imgui.WindowFlags_.always_auto_resize | imgui.WindowFlags_.no_saved_settings
+    imgui.begin("Pilot Saved Map & Route", None, win_flags)
+
+    _, HUD["show_3d_route"] = imgui.checkbox("3D Route", bool(HUD["show_3d_route"]))
+    imgui.same_line()
+    _, HUD["show_lidar"] = imgui.checkbox("2D LiDAR", bool(HUD["show_lidar"]))
+    imgui.same_line()
+    _, HUD["show_scan"] = imgui.checkbox("3D Scan", bool(HUD["show_scan"]))
+
+    walls = dbg["walls"]
+    ctype = dbg["cell_type"]
+    ccost = dbg["cell_cost"]
+    cdeaths = dbg["cell_deaths"]
+    route = dbg["route"]
+    route_set = set(tuple(c) for c in route)
+    n = len(walls)
+    cell_px = 36.0 if n <= 7 else (30.0 if n <= 9 else 27.0)
+    pad = 8.0
+    canvas_w = n * cell_px + 2 * pad
+    canvas_h = n * cell_px + 2 * pad
+
+    p0 = imgui.get_cursor_screen_pos()
+    imgui.dummy(imgui.ImVec2(canvas_w, canvas_h))
+    dl = imgui.get_window_draw_list()
+    x0, y0 = p0.x + pad, p0.y + pad
+
+    def cell_rect(ci, cj):
+        sx = x0 + ci * cell_px
+        sy = y0 + (n - 1 - cj) * cell_px
+        return sx, sy, sx + cell_px, sy + cell_px
+
+    def world_to_screen(wx, wy):
+        sx = x0 + (wx / CELL_SIZE + 0.5) * cell_px
+        sy = y0 + (n - 0.5 - wy / CELL_SIZE) * cell_px
+        return sx, sy
+
+    for i in range(n):
+        for j in range(n):
+            x1, y1, x2, y2 = cell_rect(i, j)
+            w_ij = walls[i][j]
+            explored = any(w != -1 for w in w_ij) or ctype[i][j] != 0
+            tag, rgba = _HAZARD_META.get(ctype[i][j], _HAZARD_META[0])
+            if not explored and ctype[i][j] == 0:
+                rgba = (18, 24, 34, 200)
+                tag = ""
+            elif ctype[i][j] == 0 and explored:
+                rgba = (36, 50, 68, 225)
+                tag = ""
+            dl.add_rect_filled(imgui.ImVec2(x1, y1), imgui.ImVec2(x2, y2), imgui.IM_COL32(*rgba))
+
+            if (i, j) in route_set:
+                dl.add_rect_filled(imgui.ImVec2(x1 + 2, y1 + 2), imgui.ImVec2(x2 - 2, y2 - 2),
+                                   imgui.IM_COL32(0, 245, 212, 42))
+            if (i, j) == tuple(MAZE["start"]):
+                dl.add_rect(imgui.ImVec2(x1 + 2, y1 + 2), imgui.ImVec2(x2 - 2, y2 - 2),
+                            imgui.IM_COL32(242, 166, 90, 255), 0.0, 0, 2.0)
+                tag = "START"
+            elif (i, j) == tuple(MAZE["goal"]):
+                dl.add_rect(imgui.ImVec2(x1 + 2, y1 + 2), imgui.ImVec2(x2 - 2, y2 - 2),
+                            imgui.IM_COL32(122, 201, 67, 255), 0.0, 0, 2.0)
+                tag = "GOAL"
+
+            if cdeaths[i][j] > 0:
+                dl.add_rect(imgui.ImVec2(x1 + 1, y1 + 1), imgui.ImVec2(x2 - 1, y2 - 1),
+                            imgui.IM_COL32(255, 50, 50, 255), 0.0, 0, 2.5)
+                dl.add_text(imgui.ImVec2(x1 + 3, y2 - 14), imgui.IM_COL32(255, 110, 110, 255),
+                            f"X{int(cdeaths[i][j])}")
+            elif explored and ccost[i][j] > 1.1:
+                dl.add_text(imgui.ImVec2(x1 + 3, y2 - 14), imgui.IM_COL32(210, 220, 230, 190),
+                            f"{ccost[i][j]:.0f}")
+            if tag:
+                dl.add_text(imgui.ImVec2(x1 + 3, y1 + 2), imgui.IM_COL32(245, 245, 240, 245), tag[:4])
+
+    col_wall = imgui.IM_COL32(245, 243, 235, 255)
+    col_unk = imgui.IM_COL32(90, 105, 125, 95)
+    for i in range(n):
+        for j in range(n):
+            x1, y1, x2, y2 = cell_rect(i, j)
+            w_ij = walls[i][j]
+            edges = (
+                (w_ij[0], (x2, y1), (x2, y2)),
+                (w_ij[1], (x1, y1), (x2, y1)),
+                (w_ij[2], (x1, y1), (x1, y2)),
+                (w_ij[3], (x1, y2), (x2, y2)),
+            )
+            for state, a, b in edges:
+                if state == 1:
+                    dl.add_line(imgui.ImVec2(*a), imgui.ImVec2(*b), col_wall, 3.0)
+                elif state == -1:
+                    dl.add_line(imgui.ImVec2(*a), imgui.ImVec2(*b), col_unk, 1.0)
+
+    col_route = imgui.IM_COL32(0, 245, 212, 245)
+    for k in range(len(route) - 1):
+        ax, ay = world_to_screen(route[k][0] * CELL_SIZE, route[k][1] * CELL_SIZE)
+        bx, by = world_to_screen(route[k + 1][0] * CELL_SIZE, route[k + 1][1] * CELL_SIZE)
+        dl.add_line(imgui.ImVec2(ax, ay), imgui.ImVec2(bx, by), col_route, 3.2)
+        dl.add_circle_filled(imgui.ImVec2(bx, by), 3.2, col_route)
+
+    rx, ry = world_to_screen(HUD["pos_xy"][0], HUD["pos_xy"][1])
+    wpx, wpy = world_to_screen(dbg["waypoint"][0], dbg["waypoint"][1])
+    col_wp = imgui.IM_COL32(255, 225, 55, 255)
+    dl.add_line(imgui.ImVec2(rx, ry), imgui.ImVec2(wpx, wpy), col_wp, 2.0)
+    dl.add_circle_filled(imgui.ImVec2(wpx, wpy), 4.5, col_wp)
+
+    yaw = float(HUD["yaw"])
+    hx = rx + 11.0 * math.cos(yaw)
+    hy = ry - 11.0 * math.sin(yaw)
+    dl.add_circle_filled(imgui.ImVec2(rx, ry), 5.5, imgui.IM_COL32(122, 201, 67, 255))
+    dl.add_line(imgui.ImVec2(rx, ry), imgui.ImVec2(hx, hy), imgui.IM_COL32(255, 255, 255, 255), 2.5)
+
+    cur_c = tuple(dbg["current_cell"])
+    tgt_c = tuple(dbg["target_cell"])
+    cur_tag = _HAZARD_META.get(ctype[cur_c[0]][cur_c[1]], ("?",))[0]
+    tgt_tag = _HAZARD_META.get(ctype[tgt_c[0]][tgt_c[1]], ("?",))[0]
+    dist_goal = dbg["dist"][cur_c[0]][cur_c[1]]
+    cost_str = f"{dist_goal:.1f}" if dist_goal < 1e5 else "inf"
+    vx, vy, wz = dbg["cmd"]
+    imgui.text(f"Cell {cur_c} [{cur_tag}] -> Target {tgt_c} [{tgt_tag}]")
+    imgui.text(f"Planned route: {max(len(route) - 1, 0)} cells (cost {cost_str})")
+    imgui.text(f"Cmd: vx={vx:+.2f}  vy={vy:+.2f}  wz={wz:+.2f}" + ("  [UNSTUCK]" if dbg["unstuck"] else ""))
+    imgui.text_colored(imgui.ImVec4(0.7, 0.78, 0.86, 1.0), "Cyan=Route  Yellow=Waypoint  Red=Spike/Death")
     imgui.end()
 
 
@@ -287,6 +432,92 @@ def _markers(env):
     goal[0, 1] += (MAZE["goal"][1] - MAZE["start"][1]) * CELL_SIZE
     m.visualize(translations=torch.cat((goal, o)) + 0.025, marker_indices=torch.tensor([0, 1], device=env.device))
     return m
+
+
+class _RouteMarkers:
+    """3D floor markers showing the robot's planned Dijkstra route, active local waypoint, and discovered hazards."""
+
+    def __init__(self, env):
+        import isaaclab.sim as sim_utils
+        from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+
+        cfg = VisualizationMarkersCfg(
+            prim_path="/Visuals/PilotRoute",
+            markers={
+                "route": sim_utils.CylinderCfg(
+                    radius=0.20, height=0.04,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.96, 0.83)),
+                ),
+                "waypoint": sim_utils.SphereCfg(
+                    radius=0.13,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.88, 0.15)),
+                ),
+                "hazard": sim_utils.CuboidCfg(
+                    size=(0.42, 0.42, 0.05),
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.92, 0.32, 0.18)),
+                ),
+                "death": sim_utils.CuboidCfg(
+                    size=(0.55, 0.55, 0.12),
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.12, 0.25)),
+                ),
+            },
+        )
+        self.markers = VisualizationMarkers(cfg)
+        self.device = env.device
+
+    def update(self, origin_w: torch.Tensor, dbg: dict | None, visible: bool = True):
+        if not dbg or not visible:
+            self.markers.set_visibility(False)
+            return
+        self.markers.set_visibility(True)
+        pts, idxs = [], []
+        ox, oy, oz = float(origin_w[0].item()), float(origin_w[1].item()), float(origin_w[2].item())
+        for ci, cj in dbg["route"]:
+            pts.append((ox + ci * CELL_SIZE, oy + cj * CELL_SIZE, oz + 0.04))
+            idxs.append(0)
+        wpx, wpy = dbg["waypoint"]
+        pts.append((ox + wpx, oy + wpy, oz + 0.22))
+        idxs.append(1)
+        ctype = dbg["cell_type"]
+        cdeaths = dbg["cell_deaths"]
+        n = len(ctype)
+        for i in range(n):
+            for j in range(n):
+                if cdeaths[i][j] > 0:
+                    pts.append((ox + i * CELL_SIZE, oy + j * CELL_SIZE, oz + 0.08))
+                    idxs.append(3)
+                elif ctype[i][j] >= 3:
+                    pts.append((ox + i * CELL_SIZE, oy + j * CELL_SIZE, oz + 0.05))
+                    idxs.append(2)
+        if pts:
+            t_pts = torch.tensor(pts, dtype=torch.float32, device=self.device)
+            t_idx = torch.tensor(idxs, dtype=torch.long, device=self.device)
+            self.markers.visualize(translations=t_pts, marker_indices=t_idx)
+
+
+def _extract_pilot_debug(pilot, cell, n: int) -> dict | None:
+    if hasattr(pilot, "get_debug_snapshot"):
+        return pilot.get_debug_snapshot(0)
+    ap = getattr(pilot, "ap", None)
+    if ap is None or not hasattr(ap, "walls"):
+        return None
+    walls = ap.walls[0].detach().cpu().tolist()
+    dist = ap.flood_fill(ap.walls)[0].detach().cpu().tolist()
+    tgt = tuple(int(v) for v in ap.target[0].detach().cpu().tolist())
+    return {
+        "walls": walls,
+        "cell_type": [[0] * n for _ in range(n)],
+        "cell_cost": [[1.0] * n for _ in range(n)],
+        "cell_deaths": [[0.0] * n for _ in range(n)],
+        "safe_offset": [[[0.0, 0.0] for _ in range(n)] for _ in range(n)],
+        "dist": dist,
+        "route": [cell, tgt],
+        "current_cell": cell,
+        "target_cell": tgt,
+        "waypoint": [tgt[0] * CELL_SIZE, tgt[1] * CELL_SIZE],
+        "cmd": ap.cmd[0].detach().cpu().tolist() if hasattr(ap, "cmd") else [0.0, 0.0, 0.0],
+        "unstuck": False,
+    }
 
 
 class _Recorder:
@@ -400,6 +631,7 @@ def challenge_playback(step, *, dt, args_cli, env_cfg):
     cmd.is_heading_env[:] = False
     cmd.is_standing_env[:] = False
     scanner, lidar = env.scene["maze_scanner"], env.scene["wall_lidar"]
+    scanner.set_debug_vis(True)  # show the lidar rays in the viewer
     walls, hazards = GENERATED[-1]["walls"], HAZARDS[-1]
     n_env, n = env.num_envs, walls.shape[0]
     start, goal = tuple(hazards["start"]), tuple(hazards["goal"])
@@ -421,8 +653,11 @@ def challenge_playback(step, *, dt, args_cli, env_cfg):
 
     pilot = make_pilot(load_pilot(RUN["pilot"]), n_env, n, env.device, start, goal)
     viewer = _find_viewer()
+    route_markers = None
+    last_lidar_vis = last_scan_vis = False
     if viewer is not None:
         markers = _markers(env)  # noqa: F841
+        route_markers = _RouteMarkers(env)
         viewer.register_ui_callback(_hud, position="free")
     HUD.update(team=RUN["team"] or "(test)", seed=RUN["seed"], level=RUN["level"])
     recorder = _Recorder() if viewer is not None and REC else None
@@ -514,6 +749,19 @@ def challenge_playback(step, *, dt, args_cli, env_cfg):
             pilot.reset(torch.arange(n_env, device=env.device))
             print(f"[CHALLENGE] t={t:.1f}s fall/crash #{falls} in cell {prev_cell} -> back to start", flush=True)
             HUD["why"], why = why, "FELL / CRASH"
+        if viewer is not None and k % 2 == 0:
+            dbg = _extract_pilot_debug(pilot, cell, n)
+            HUD["pilot"] = dbg
+            HUD["pos_xy"] = p
+            HUD["yaw"] = float(obs["yaw"][0].item())
+            if route_markers is not None:
+                route_markers.update(o[0], dbg, bool(HUD["show_3d_route"]))
+            if bool(HUD["show_lidar"]) != last_lidar_vis:
+                last_lidar_vis = bool(HUD["show_lidar"])
+                lidar.set_debug_vis(last_lidar_vis)
+            if bool(HUD["show_scan"]) != last_scan_vis:
+                last_scan_vis = bool(HUD["show_scan"])
+                scanner.set_debug_vis(last_scan_vis)
         HUD.update(
             t=finish if finish is not None else t,
             left=0 if finish is not None else left,

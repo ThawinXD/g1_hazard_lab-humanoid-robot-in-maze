@@ -143,6 +143,7 @@ class Pilot:
         self.anchor_time = torch.zeros(num_envs, dtype=torch.float32, device=device)  # Time when anchor was updated
         self.unstuck_until = torch.full((num_envs,), -1.0, dtype=torch.float32, device=device)  # End time of unstuck maneuver
         self.unstuck_dir = torch.ones(num_envs, dtype=torch.float32, device=device)  # Alternating +1/-1 turn direction
+        self.last_wp = self.ap.centre_of(self.last_cell)  # Latest continuous sub-waypoint XY for visualization (N, 2)
         self.sim_time = 0.0  # Latest elapsed simulation time [s]
 
     # ------------------------------------------------------------------
@@ -296,32 +297,100 @@ class Pilot:
         base_cost = self.cost_table[hazard_type]  # Look up base traversal cost for this hazard type
         self.cell_cost[env_id, ci, cj] = base_cost + 50.0 * self.cell_deaths[env_id, ci, cj]  # Add reset penalty
 
+    def _scan_walls_with_coverage(
+        self,
+        scan_xy: torch.Tensor,
+        scan_z: torch.Tensor,
+        cell: torch.Tensor,
+        lidar_xy: torch.Tensor | None = None,
+        lidar_valid: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Detect walls and sensor coverage for each of the 4 sides of ``cell``.
+
+        Returns:
+            walls_hit: (N, 4) bool -- True when >= 3 tall height-scan points (or >= 2 2D LiDAR hits)
+                       land inside side d's wall bounding box.
+            covered:   (N, 4) bool -- True when >= 8 height-scan rays landed inside side d's bounding
+                       box, proving the wall is inside the 3.2x3.2 m scanner window (not behind out of range).
+        """
+        centre = self.ap.centre_of(cell).unsqueeze(1)  # (N, 1, 2) world XY center of cell
+        rel = scan_xy - centre  # (N, R, 2) ray offsets from cell center
+        tall = scan_z > 0.50  # (N, R) points above 0.50 m (maze walls are 1.0 m tall; all floor hazards <= 0.35 m)
+        n_envs = scan_xy.shape[0]
+        walls_hit = torch.zeros((n_envs, 4), dtype=torch.bool, device=self.device)
+        covered = torch.zeros((n_envs, 4), dtype=torch.bool, device=self.device)
+        half = 0.5 * self.cell_size  # 1.0 m distance from cell center to each wall
+
+        for d, (dx, dy) in enumerate(DIRS):  # 0=East, 1=North, 2=West, 3=South
+            along = rel[..., 0] * dx + rel[..., 1] * dy  # Distance along normal toward side d [m]
+            across = rel[..., 0] * dy - rel[..., 1] * dx  # Distance along wall tangent [m]
+            in_box = (torch.abs(along - half) < 0.15) & (torch.abs(across) < 0.60)  # 0.30 m x 1.20 m wall box
+            covered[:, d] = in_box.sum(dim=1) >= 8  # At least 8 rays must land in the box to confirm visibility
+            walls_hit[:, d] = (in_box & tall).sum(dim=1) >= 3  # >= 3 tall hits confirms a physical wall
+
+            # Fuse 2D horizontal chest LiDAR hit points (which fly at z ~ 0.75 m over all hazards and only hit walls)
+            if lidar_xy is not None and lidar_valid is not None:
+                l_rel = lidar_xy - centre  # (N, 72, 2)
+                l_along = l_rel[..., 0] * dx + l_rel[..., 1] * dy
+                l_across = l_rel[..., 0] * dy - l_rel[..., 1] * dx
+                l_in_box = lidar_valid & (torch.abs(l_along - half) < 0.18) & (torch.abs(l_across) < 0.60)
+                walls_hit[:, d] |= l_in_box.sum(dim=1) >= 2  # >= 2 LiDAR hits on the boundary confirms a wall
+
+        return walls_hit, covered
+
+    def _update_cell_walls(
+        self, env_id: int, ci: int, cj: int, walls_hit: torch.Tensor, covered: torch.Tensor
+    ):
+        """Latch confirmed walls (1) permanently and only mark open (0) when inside sensor coverage."""
+        for d, (di, dj) in enumerate(DIRS):  # 0=East, 1=North, 2=West, 3=South
+            ni, nj = ci + di, cj + dj  # Neighbor cell across side d
+            in_grid = 0 <= ni < self.num_cells and 0 <= nj < self.num_cells
+            opp_d = (d + 2) % 4  # Opposite wall index in neighbor cell
+
+            if bool(walls_hit[d].item()):
+                # Confirmed wall: latch permanently as 1 (never overwritten when robot walks out of range)
+                self.ap.walls[env_id, ci, cj, d] = 1
+                if in_grid:
+                    self.ap.walls[env_id, ni, nj, opp_d] = 1
+            elif bool(covered[d].item()) and int(self.ap.walls[env_id, ci, cj, d].item()) != 1:
+                # Confirmed open with full sensor coverage (and never previously latched as a wall)
+                self.ap.walls[env_id, ci, cj, d] = 0
+                if in_grid and int(self.ap.walls[env_id, ni, nj, opp_d].item()) != 1:
+                    self.ap.walls[env_id, ni, nj, opp_d] = 0
+
     def sense_environment(self, obs: dict, cell: torch.Tensor) -> torch.Tensor:
         """Sense walls of current + adjacent cells and classify floor hazards within the 3.2x3.2 m scan."""
         scan_xy = obs["scan_xy"]  # Ray hit XY coordinates in maze frame (N, 1089, 2)
         scan_z = obs["scan_z"]  # Ray hit Z coordinates relative to floor (N, 1089)
-        walls_now = self.ap.walls_from_height_scan(scan_xy, scan_z, cell)  # Detect blocked sides (N, 4)
 
-        # Fuse horizontal chest lidar wall detections when the robot is near the cell center
+        # Reconstruct 2D chest LiDAR hit XY coordinates in maze frame (up to 5.5 m range)
+        lidar_xy = None
+        lidar_valid = None
+        if "lidar_dist" in obs and "lidar_yaw" in obs:
+            l_dist = obs["lidar_dist"]  # (N, 72)
+            l_yaw = obs["lidar_yaw"]  # (N, 72)
+            lidar_valid = (l_dist > 0.15) & (l_dist < 5.5)  # Valid wall hits within 5.5 m
+            lidar_xy = obs["pos_xy"].unsqueeze(1) + l_dist.unsqueeze(-1) * torch.stack(
+                [torch.cos(l_yaw), torch.sin(l_yaw)], dim=-1
+            )  # (N, 72, 2)
+
+        # Detect walls and sensor coverage for the current cell
+        walls_hit, covered = self._scan_walls_with_coverage(scan_xy, scan_z, cell, lidar_xy, lidar_valid)
+
+        # Also fuse angular 2D LiDAR cone check when reasonably near the cell center (< 0.60 m, includes safe lanes)
         if "lidar_dist" in obs and "lidar_yaw" in obs:
             offset_xy = obs["pos_xy"] - self.ap.centre_of(cell)  # Robot offset from current cell center (N, 2)
-            near = torch.linalg.norm(offset_xy, dim=1) < 0.45  # True when within 0.45 m of cell center
-            if near.any():  # Combine height-scan walls with 2D lidar walls for robustness
+            near = torch.linalg.norm(offset_xy, dim=1) < 0.60  # Includes +-0.48 m safe lanes
+            if near.any():
                 lidar_walls = self.ap.walls_from_lidar(obs["lidar_dist"], obs["lidar_yaw"], offset_xy)
-                walls_now = torch.where(near.unsqueeze(1), walls_now | lidar_walls, walls_now)
+                walls_hit = torch.where(near.unsqueeze(1), walls_hit | lidar_walls, walls_hit)
 
-        # Write sensed walls into the persistent wall map (both current cell and symmetric neighbor edge)
-        for d, (di, dj) in enumerate(DIRS):  # Loop over 0=East, 1=North, 2=West, 3=South
-            ci, cj = cell[:, 0], cell[:, 1]  # Current cell indices for all envs
-            val = walls_now[:, d].to(torch.int8)  # 1 = blocked, 0 = open
-            self.ap.walls[torch.arange(self.num_envs, device=self.device), ci, cj, d] = val  # Update current cell
-            ni, nj = ci + di, cj + dj  # Neighbor cell coordinates in direction d
-            inside = (ni >= 0) & (ni < self.num_cells) & (nj >= 0) & (nj < self.num_cells)  # Valid grid check
-            env_idx = torch.nonzero(inside).squeeze(1)  # Environments with valid neighbor in direction d
-            if len(env_idx) > 0:  # Update opposite wall (d + 2) % 4 of the neighbor cell
-                self.ap.walls[env_idx, ni[inside], nj[inside], (d + 2) % 4] = val[inside]
+        # Update persistent wall map for current cell using coverage-gated latching (never forgets passed walls!)
+        for b in range(self.num_envs):
+            ci, cj = int(cell[b, 0].item()), int(cell[b, 1].item())
+            self._update_cell_walls(b, ci, cj, walls_hit[b], covered[b])
 
-        # Classify floor hazards in the current cell and all open neighbor cells within scanner range
+        # Classify floor hazards and sense walls in all neighbor cells within scanner/LiDAR range
         for b in range(self.num_envs):  # Loop over each environment
             ci, cj = int(cell[b, 0].item()), int(cell[b, 1].item())  # Current cell (ci, cj)
             h_dir = int(self.ap.heading[b].item())  # Current heading direction index (0..3)
@@ -329,27 +398,31 @@ class Pilot:
             self._classify_cell_from_scan(b, ci, cj, scan_xy[b], scan_z[b], fallback_axis)  # Classify current cell
 
             for d, (di, dj) in enumerate(DIRS):  # Check all 4 neighbors around (ci, cj)
-                if walls_now[b, d]:  # Do not peek through a blocked wall
-                    continue
                 ni, nj = ci + di, cj + dj  # Neighbor cell indices
-                if 0 <= ni < self.num_cells and 0 <= nj < self.num_cells:  # Must lie inside the maze grid
-                    nb_cell = torch.tensor([[ni, nj]], dtype=torch.long, device=self.device)  # Neighbor tensor
-                    nb_centre = self.ap.centre_of(nb_cell)  # World XY center of neighbor cell
-                    # If the robot is within 1.85 m of the neighbor center, the 3.2x3.2m scan sees its walls too
-                    if float(torch.linalg.norm(obs["pos_xy"][b : b + 1] - nb_centre).item()) < 1.85:
-                        nb_walls = self.ap.walls_from_height_scan(
-                            scan_xy[b : b + 1], scan_z[b : b + 1], nb_cell
-                        )[0]  # Detect walls of neighbor cell
-                        for nd, (ndi, ndj) in enumerate(DIRS):  # Record confirmed walls of the neighbor cell
-                            if nb_walls[nd]:
-                                self.ap.walls[b, ni, nj, nd] = 1  # Mark neighbor side nd as wall
-                                nni, nnj = ni + ndi, nj + ndj  # Neighbor's neighbor
-                                if 0 <= nni < self.num_cells and 0 <= nnj < self.num_cells:
-                                    self.ap.walls[b, nni, nnj, (nd + 2) % 4] = 1  # Symmetric wall mark
-                    nb_axis = 0 if di != 0 else 1  # Entering neighbor along X (0) or Y (1)
-                    self._classify_cell_from_scan(b, ni, nj, scan_xy[b], scan_z[b], nb_axis)  # Classify neighbor
+                if not (0 <= ni < self.num_cells and 0 <= nj < self.num_cells):  # Must lie inside the maze grid
+                    continue
+                nb_cell = torch.tensor([[ni, nj]], dtype=torch.long, device=self.device)  # Neighbor tensor (1, 2)
+                nb_centre = self.ap.centre_of(nb_cell)  # World XY center of neighbor cell
+                dist_to_nb = float(torch.linalg.norm(obs["pos_xy"][b : b + 1] - nb_centre).item())
 
-        return walls_now  # Return (N, 4) boolean tensor of current cell walls
+                # Sense neighbor walls via top-down height scan + 2D LiDAR hits (up to 2.6 m away)
+                if dist_to_nb < 2.60:
+                    l_xy_b = lidar_xy[b : b + 1] if lidar_xy is not None else None
+                    l_val_b = lidar_valid[b : b + 1] if lidar_valid is not None else None
+                    nb_hit, nb_cov = self._scan_walls_with_coverage(
+                        scan_xy[b : b + 1], scan_z[b : b + 1], nb_cell, l_xy_b, l_val_b
+                    )
+                    self._update_cell_walls(b, ni, nj, nb_hit[0], nb_cov[0])
+
+                # Only classify floor hazards inside open neighbors (do not classify across a blocked wall)
+                if int(self.ap.walls[b, ci, cj, d].item()) == 1:
+                    continue
+                nb_axis = 0 if di != 0 else 1  # Entering neighbor along X (0) or Y (1)
+                self._classify_cell_from_scan(b, ni, nj, scan_xy[b], scan_z[b], nb_axis)  # Classify neighbor
+
+        # Return the persistent remembered walls (N, 4) of the current cell (so passed walls stay 1!)
+        env_arange = torch.arange(self.num_envs, device=self.device)
+        return self.ap.walls[env_arange, cell[:, 0], cell[:, 1]] == 1
 
     # ------------------------------------------------------------------
     # 2. Global Route Planning: Hazard-Weighted Dijkstra
@@ -542,9 +615,14 @@ class Pilot:
             torch.full((self.num_envs,), 0.52, device=self.device),
         )
 
-        # Check if robot has arrived at its current target cell
-        near_centre = torch.linalg.norm(pos_xy - self.ap.centre_of(cell), dim=1) < turn_radius
-        arrived = near_centre & (cell == self.ap.target).all(dim=1)  # Arrived at target cell center
+        # Check if robot has arrived at its current target cell (accounting for +-0.48 m safe-lane offset in spike cells)
+        rel_centre = pos_xy - self.ap.centre_of(cell)  # (N, 2) offset from cell center
+        dir_vec = self.ap._dirs[self.ap.heading].to(pos_xy.dtype)  # (N, 2) unit vector along travel heading
+        u_along = (rel_centre * dir_vec).sum(dim=1)  # Signed longitudinal position in cell [-1.0, +1.0]
+        in_spike_cell = (cur_type == CELL_SPIKE_LANE) | (cur_type == CELL_SPIKE_SLALOM)
+        near_spike_mid = in_spike_cell & (torch.abs(u_along) < 0.30)  # Passing longitudinal center in safe lane
+        near_centre = (torch.linalg.norm(rel_centre, dim=1) < turn_radius) | near_spike_mid
+        arrived = near_centre & (cell == self.ap.target).all(dim=1)  # Arrived at target cell decision point
 
         # Re-evaluate direction if a newly sensed wall blocks our heading OR a hard hazard is spotted ahead
         still_there = (cell == self.ap.origin).all(dim=1) & ~self.ap.need_decision
@@ -599,6 +677,7 @@ class Pilot:
             wp, max_spd, vy_bias = self._compute_waypoint_and_speed(
                 b, pos_xy[b], float(yaw[b].item()), cell[b], obs["scan_xy"][b], obs["scan_z"][b]
             )
+            self.last_wp[b] = wp  # Store active local waypoint XY for viewer HUD & 3D markers
             to_wp = wp - pos_xy[b]  # Vector from robot to waypoint in maze frame (2,)
             yaw_err = math.atan2(float(to_wp[1].item()), float(to_wp[0].item())) - float(yaw[b].item())
             yaw_err = math.atan2(math.sin(yaw_err), math.cos(yaw_err))  # Wrap heading error to [-pi, pi]
@@ -659,5 +738,64 @@ class Pilot:
         self.last_cell[env_ids] = start  # Reset last cell tracker
         self.last_target[env_ids] = start  # Reset last target tracker
         self.pos_anchor[env_ids] = self.ap.centre_of(start)  # Reset anti-stuck position anchor
+        self.last_wp[env_ids] = self.ap.centre_of(start)  # Reset visualized waypoint to start cell center
         self.anchor_time[env_ids] = self.sim_time  # Reset anti-stuck timer
         self.unstuck_until[env_ids] = -1.0  # Clear any active unstuck reflex
+
+    # ------------------------------------------------------------------
+    # 5. Telemetry & Route Visualization Helpers
+    # ------------------------------------------------------------------
+    def trace_planned_route(
+        self, env_id: int = 0, start_cell: tuple[int, int] | None = None
+    ) -> list[tuple[int, int]]:
+        """Trace the sequence of cells [(i, j), ...] along the current Weighted Dijkstra route to goal_cell."""
+        dist = self.weighted_flood_fill(self.ap.walls)[env_id]  # Cost-to-goal matrix (N, N) for env_id
+        costs = self.cell_cost[env_id]  # Per-cell traversal cost matrix (N, N) for env_id
+        walls = self.ap.walls[env_id]  # Known/unknown wall matrix (N, N, 4) for env_id
+        cur = start_cell or (
+            int(self.last_cell[env_id, 0].item()),
+            int(self.last_cell[env_id, 1].item()),
+        )  # Starting cell tuple
+        route = [cur]  # Ordered list of cells along the planned route
+        visited = {cur}  # Prevent cycles if all directions are equally blocked
+        for _ in range(self.num_cells * self.num_cells):  # Step at most N^2 times
+            if cur == self.goal_cell:  # Reached goal cell
+                break
+            ci, cj = cur  # Current cell coordinates in trace
+            best_nb = None  # Best neighbor cell found
+            best_val = 1e9  # Lowest total cost (dist + step_cost)
+            for d, (di, dj) in enumerate(DIRS):  # Check East (0), North (1), West (2), South (3)
+                if int(walls[ci, cj, d].item()) == 1:  # Confirmed wall blocks this edge
+                    continue
+                ni, nj = ci + di, cj + dj  # Neighbor coordinates
+                if 0 <= ni < self.num_cells and 0 <= nj < self.num_cells and (ni, nj) not in visited:
+                    val = float(dist[ni, nj].item() + costs[ni, nj].item())  # Total cost via neighbor
+                    if val < best_val:  # Found cheaper next cell
+                        best_val = val  # Update lowest cost
+                        best_nb = (ni, nj)  # Update chosen neighbor
+            if best_nb is None or best_val >= 1e5:  # No reachable path found
+                break
+            route.append(best_nb)  # Append next cell to route
+            visited.add(best_nb)  # Mark cell visited in trace
+            cur = best_nb  # Advance trace cursor
+        return route  # Return ordered list of cells from current cell to goal
+
+    def get_debug_snapshot(self, env_id: int = 0) -> dict:
+        """Return a snapshot dict of the robot's saved map, hazard classifications, costs, and planned route."""
+        dist = self.weighted_flood_fill(self.ap.walls)[env_id]  # Current cost-to-goal map (N, N)
+        cur = (int(self.last_cell[env_id, 0].item()), int(self.last_cell[env_id, 1].item()))  # Current cell
+        tgt = (int(self.ap.target[env_id, 0].item()), int(self.ap.target[env_id, 1].item()))  # Target cell
+        return {
+            "walls": self.ap.walls[env_id].detach().cpu().tolist(),  # (N, N, 4): 1=wall, 0=open, -1=unknown
+            "cell_type": self.cell_type[env_id].detach().cpu().tolist(),  # (N, N): hazard type enum
+            "cell_cost": self.cell_cost[env_id].detach().cpu().tolist(),  # (N, N): traversal cost
+            "cell_deaths": self.cell_deaths[env_id].detach().cpu().tolist(),  # (N, N): reset count per cell
+            "safe_offset": self.safe_offset[env_id].detach().cpu().tolist(),  # (N, N, 2): safe lane offsets [m]
+            "dist": dist.detach().cpu().tolist(),  # (N, N): cumulative Dijkstra cost-to-goal
+            "route": self.trace_planned_route(env_id, cur),  # Planned route cells [(i, j), ...]
+            "current_cell": cur,  # Current cell (ci, cj)
+            "target_cell": tgt,  # Immediate target cell (ti, tj)
+            "waypoint": self.last_wp[env_id].detach().cpu().tolist(),  # Active local waypoint [wp_x, wp_y]
+            "cmd": self.ap.cmd[env_id].detach().cpu().tolist(),  # Current command [v_x, v_y, w_z]
+            "unstuck": self.sim_time < float(self.unstuck_until[env_id].item()),  # True during unstuck reflex
+        }
