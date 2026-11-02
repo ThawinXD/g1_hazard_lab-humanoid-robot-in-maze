@@ -13,6 +13,7 @@ spike beds from the wall to just short of the middle, slalom beds at |u| in [0.3
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 
@@ -22,7 +23,21 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from pilot import CELL_LOW_RAMP, CELL_SPIKE_SLALOM, CELL_STEEP_RAMP, Pilot  # noqa: E402
+from pilot import (  # noqa: E402
+    CELL_ICE,
+    CELL_LOW_RAMP,
+    CELL_SPIKE_LANE,
+    CELL_SPIKE_SLALOM,
+    CELL_PLAIN,
+    CELL_ROUGH,
+    CELL_STEEP_RAMP,
+    CELL_TRENCH,
+    PIVOT_BRAKE_ACC_ICE,
+    PIVOT_TURN_RATE_ICE,
+    TRENCH_CLEAR_U,
+    TRENCH_SPEED,
+    Pilot,
+)
 from g1_maze_lab.autopilot import DIRS  # noqa: E402
 
 CELL = 2.0
@@ -78,9 +93,10 @@ def _rough(xy, ci, cj, axis=0):
     return z
 
 
-def _obs(pos, z_fn, t, yaw=0.0) -> dict:
+def _obs(pos, z_fn, t, yaw=0.0, segments=None, lin_vel=None) -> dict:
+    """Sensor dict like challenge.py. ``segments`` = wall segments ((x0, y0), (x1, y1)) seen by the 72-ray lidar."""
     xy = _grid(*pos)
-    return {
+    obs = {
         "pos_xy": torch.tensor([pos], dtype=torch.float32),
         "yaw": torch.tensor([yaw], dtype=torch.float32),
         "t": t,
@@ -88,6 +104,46 @@ def _obs(pos, z_fn, t, yaw=0.0) -> dict:
         "scan_xy": xy.unsqueeze(0),
         "scan_z": z_fn(xy).unsqueeze(0),
     }
+    if segments is not None:
+        dist, ang = _lidar(pos, segments, yaw)
+        obs["lidar_dist"], obs["lidar_yaw"] = dist.unsqueeze(0), ang.unsqueeze(0)
+    if lin_vel is not None:
+        obs["lin_vel_b"] = torch.tensor([[lin_vel[0], lin_vel[1], 0.0]])
+    return obs
+
+
+def _lidar(pos, segments, yaw=0.0, max_range=6.0):
+    """72 horizontal rays every 5 deg (world yaw), ray-cast against 2D wall segments; misses read 1e6."""
+    ang = torch.tensor([yaw + math.radians(5 * k) for k in range(72)])
+    dist = torch.full((72,), 1e6)
+    px, py = pos
+    for (x0, y0), (x1, y1) in segments:
+        ex, ey = x1 - x0, y1 - y0
+        for k in range(72):
+            ux, uy = math.cos(float(ang[k])), math.sin(float(ang[k]))
+            den = ux * ey - uy * ex
+            if abs(den) < 1e-9:
+                continue
+            t = ((x0 - px) * ey - (y0 - py) * ex) / den  # Distance along the ray
+            s = ((x0 - px) * uy - (y0 - py) * ux) / den  # Position along the segment (0..1)
+            if 0.0 < t < max_range and 0.0 <= s <= 1.0 and t < dist[k]:
+                dist[k] = t
+    return dist, torch.atan2(torch.sin(ang), torch.cos(ang))
+
+
+def _walls_z(segments):
+    """Height-scan z function: 1.0 m within 0.075 m of any wall segment (wall thickness 0.15 m), floor elsewhere."""
+
+    def z_fn(xy):
+        z = torch.zeros(len(xy))
+        for (x0, y0), (x1, y1) in segments:
+            lo_x, hi_x = min(x0, x1) - 0.075, max(x0, x1) + 0.075
+            lo_y, hi_y = min(y0, y1) - 0.075, max(y0, y1) + 0.075
+            inside = (xy[:, 0] >= lo_x) & (xy[:, 0] <= hi_x) & (xy[:, 1] >= lo_y) & (xy[:, 1] <= hi_y)
+            z = torch.where(inside, torch.ones_like(z), z)
+        return z
+
+    return z_fn
 
 
 def _close_wall(p: Pilot, ci: int, cj: int, d: int):
@@ -263,3 +319,274 @@ def test_corner_is_decided_early_and_walked_as_a_curve(monkeypatch):
     p.act(_obs((3.5, 0.0), lambda xy: torch.zeros(len(xy)), t=1.02))  # within the 0.7 m lookahead of the bend
     wx, wy = p.last_wp[0].tolist()
     assert 3.9 < wx < 4.05 and 0.05 < wy < 0.6, f"lookahead point ({wx:.2f}, {wy:.2f}) is not around the corner"
+
+
+# ----------------------------------------------------------------------------- dead ends + turn-back on the spot
+
+
+def _dead_end_east_of_1_0(p: Pilot):
+    """(2, 0) closed east and north (south is the maze border), (1, 0) closed north: the only way on is back west."""
+    _close_wall(p, 2, 0, 0)
+    _close_wall(p, 2, 0, 1)
+    _close_wall(p, 1, 0, 1)
+
+
+def test_dead_end_target_turns_back_before_entering(monkeypatch):
+    """Robot in (1, 0) walking to (2, 0). When (2, 0) turns out to be a dead end, it must re-decide right away
+    (back west) while still in (1, 0), and turn back with the on-the-spot maneuver."""
+    p = _pilot(monkeypatch)
+    _set_plan(p, origin=(1, 0), target=(2, 0), heading=0)
+    p.act(_obs((2.6, 0.0), lambda xy: torch.zeros(len(xy)), t=1.0))  # Records the cost of the chosen target
+    _dead_end_east_of_1_0(p)  # ... which is now seen to be a dead end
+    p.act(_obs((2.6, 0.0), lambda xy: torch.zeros(len(xy)), t=1.02))
+    assert tuple(p.ap.target[0].tolist()) == (0, 0), "did not turn back when the target became a dead end"
+    assert int(p.pivot_state[0]) > 0, "turn-back is not done with the on-the-spot maneuver"
+
+
+def test_robot_inside_dead_end_decides_immediately(monkeypatch):
+    """Robot just inside the dead-end cell (2, 0): decide now instead of walking on to the cell's centre."""
+    p = _pilot(monkeypatch)
+    _dead_end_east_of_1_0(p)
+    _set_plan(p, origin=(1, 0), target=(2, 0), heading=0)
+    p.act(_obs((3.2, 0.0), lambda xy: torch.zeros(len(xy)), t=1.0))
+    assert tuple(p.ap.target[0].tolist()) == (1, 0), "kept walking into the dead end"
+
+
+def test_lidar_maps_dead_end_corridor(monkeypatch):
+    """Start (0, 0) facing east into a 3-cell corridor that ends at x = 5; north of the start is open.
+    The lidar must map the corridor's far walls (beyond the height scan) so the planner goes north instead."""
+    p = _pilot(monkeypatch)
+    segs = [
+        ((1.0, 1.0), (5.0, 1.0)),  # north walls of (1, 0) and (2, 0)
+        ((5.0, -1.0), (5.0, 1.0)),  # east wall of (2, 0): the dead end
+        ((-1.0, -1.0), (5.0, -1.0)),  # south border
+        ((-1.0, -1.0), (-1.0, 3.0)),  # west border
+        ((1.0, 1.0), (1.0, 3.0)),  # east wall of (0, 1); its north side stays open (the way on)
+    ]
+    for k in range(9):  # 3 sensing cycles (scan every 3rd step), robot standing at the start
+        p.act(_obs((0.0, 0.0), _walls_z(segs), t=1.0 + k * DT, segments=segs))
+    w = p.ap.walls[0]
+    assert int(w[2, 0, 0]) == 1, "end wall of the corridor (x = 5) not mapped"
+    assert int(w[2, 0, 1]) == 1, "north wall of (2, 0), 4 m away, not mapped"
+    assert int(w[1, 0, 0]) == 0, "boundary between (1, 0) and (2, 0) not mapped as open"
+    assert int(p.ap.heading[0]) == 1, "planner still walks into the dead-end corridor instead of going north"
+
+
+def test_reverse_brakes_then_rotates_in_place(monkeypatch):
+    """Walking east at 0.8 m/s when a turn-back is chosen: first brake to a stop without turning, then rotate on
+    the spot (no forward or sideways motion)."""
+    p = _pilot(monkeypatch)
+    _set_plan(p, origin=(1, 0), target=(2, 0), heading=0)
+    p.act(_obs((2.6, 0.0), lambda xy: torch.zeros(len(xy)), t=1.0, lin_vel=(0.8, 0.0)))
+    p.ap.cmd[0] = torch.tensor([0.8, 0.0, 0.0])
+    _dead_end_east_of_1_0(p)
+    v_prev, rotated = 0.8, False
+    for k in range(80):
+        cmd = p.act(_obs((2.6, 0.0), lambda xy: torch.zeros(len(xy)), t=1.02 + k * DT, lin_vel=(v_prev, 0.0)))
+        v, vy, w = (float(x) for x in cmd[0])
+        if v > 0.05:  # Still braking: no turning, no side-stepping
+            assert abs(w) < 0.05 and abs(vy) < 0.05, f"turning ({w:+.2f} rad/s) while still walking at {v:.2f} m/s"
+        if abs(w) > 0.4:
+            assert abs(v) < 1e-6 and abs(vy) < 1e-6, f"rotating with v=({v:+.2f}, {vy:+.2f}) instead of on the spot"
+            rotated = True
+        v_prev = max(v, 0.0)  # The robot tracks the command
+    assert rotated, "never rotated on the spot"
+
+
+def test_pivot_steps_away_from_close_wall_first(monkeypatch):
+    """Turning back 0.3 m from a wall: step away from it (no rotation) before rotating."""
+    p = _pilot(monkeypatch)
+    segs = [((2.9, -1.0), (2.9, 1.0))]  # Wall 0.3 m in front of the robot
+    _set_plan(p, origin=(1, 0), target=(0, 0), heading=2)
+    p._start_pivot(0, 2)
+    p.act(_obs((2.6, 0.0), _walls_z(segs), t=1.0, segments=segs, lin_vel=(0.0, 0.0)))  # Brake (already stopped)
+    cmd = p.act(_obs((2.6, 0.0), _walls_z(segs), t=1.02, segments=segs, lin_vel=(0.0, 0.0)))
+    v, vy, w = (float(x) for x in cmd[0])
+    assert v < -0.1 and abs(w) < 1e-6, f"command ({v:+.2f}, {vy:+.2f}, {w:+.2f}) does not back away from the wall"
+
+
+def test_pivot_does_not_trigger_unstuck(monkeypatch):
+    """Standing still while turning on the spot is intended: the 3.5 s anti-stuck reflex must not fire."""
+    p = _pilot(monkeypatch)
+    _set_plan(p, origin=(1, 0), target=(0, 0), heading=2)
+    p._start_pivot(0, 2)
+    for k in range(225):  # 4.5 s; the test robot never actually turns, so the pivot stays active
+        t = 1.0 + k * DT
+        p.act(_obs((2.6, 0.0), lambda xy: torch.zeros(len(xy)), t=t, lin_vel=(0.0, 0.0)))
+        assert float(p.unstuck_until[0]) < t, f"unstuck reflex fired during the turn-back at t = {t:.2f} s"
+
+
+def test_normal_corner_does_not_pivot(monkeypatch):
+    """A 90 deg corner is walked as a curve, never with the stop-and-rotate turn-back."""
+    p = _pilot(monkeypatch)
+    _close_wall(p, 2, 0, 0)
+    _set_plan(p, origin=(1, 0), target=(2, 0), heading=0)
+    for k in range(5):
+        p.act(_obs((3.2 + 0.02 * k, 0.0), lambda xy: torch.zeros(len(xy)), t=1.0 + k * DT))
+        assert int(p.pivot_state[0]) == 0, "ordinary corner triggered the turn-back maneuver"
+
+
+def test_stuck_guard_moves_off_last_check_position(monkeypatch):
+    """challenge.py resets a robot that is within 0.25 m of where it was at the previous 10 s check. Standing (e.g.
+    turning on the spot) at that same spot just before the next check, the pilot must move away along the corridor
+    without turning; far from that spot it must leave the command alone."""
+    p = _pilot(monkeypatch)
+    _set_plan(p, origin=(1, 0), target=(0, 0), heading=2)
+    p._start_pivot(0, 2)
+    flat = lambda xy: torch.zeros(len(xy))
+    p.act(_obs((2.6, 0.0), flat, t=10.0, lin_vel=(0.0, 0.0)))  # Check at t = 10 s records this position
+    for k in range(20):  # 19.2 s .. 19.6 s: inside the guard window before the t = 20 s check
+        cmd = p.act(_obs((2.6, 0.0), flat, t=19.2 + k * DT, lin_vel=(0.0, 0.0)))
+    v, vy, w = (float(x) for x in cmd[0])
+    assert math.hypot(v, vy) > 0.2 and abs(w) < 0.05, f"command ({v:+.2f}, {vy:+.2f}, {w:+.2f}) does not move away"
+    assert p._stuck_guard(0, torch.tensor([4.0, 0.0]), 0.0) is None, "guard active although far from the check position"
+
+
+def test_no_new_target_inside_goal_cell(monkeypatch):
+    """GOAL needs the robot within 0.6 m of the goal cell's centre. Entering the goal cell (6, 6) from the south,
+    the pilot must keep walking to its centre, not pick a next cell and turn back out (ping-pong at the goal)."""
+    p = _pilot(monkeypatch)
+    _close_wall(p, 6, 5, 2)  # (6, 5) closed west: the corridor leads straight into the goal
+    _set_plan(p, origin=(6, 5), target=(6, 6), heading=1)
+    for k in range(5):
+        p.act(_obs((12.0, 11.1 + 0.02 * k), lambda xy: torch.zeros(len(xy)), t=1.0 + k * DT, yaw=math.pi / 2))
+    assert tuple(p.ap.target[0].tolist()) == (6, 6), "picked a new target inside the goal cell"
+    assert int(p.pivot_state[0]) == 0, "turning back inside the goal cell"
+
+
+def test_late_replan_turn_rotates_on_the_spot(monkeypatch):
+    """Past the centre of (2, 0), walking east, the target (3, 0) turns out to be a dead end and the only way on
+    is north: too late for a curve, so the 90 deg turn is done by stopping and rotating on the spot."""
+    p = _pilot(monkeypatch)
+    _set_plan(p, origin=(2, 0), target=(3, 0), heading=0)
+    flat = lambda xy: torch.zeros(len(xy))
+    p.act(_obs((4.3, 0.0), flat, t=1.0))  # Records the cost of the chosen target
+    _close_wall(p, 3, 0, 0)  # (3, 0): closed east and north (south is the border) -> dead end
+    _close_wall(p, 3, 0, 1)
+    p.act(_obs((4.3, 0.0), flat, t=1.02))
+    assert int(p.ap.heading[0]) == 1, "did not replan north"
+    assert int(p.pivot_state[0]) > 0, "late 90 deg turn not done on the spot"
+
+
+def test_spike_lane_lined_up_before_the_bed_when_far_off_lane(monkeypatch):
+    """Heading south from (4, 5) into spike-lane cell (4, 4) (bed on the east side, safe lane x = 7.52) while
+    0.9 m east of the lane (e.g. after sliding on ice): first line up with the lane well before the bed (y >= 9.3),
+    not aim straight at the bed's entry corner."""
+    p = _pilot(monkeypatch)
+    p.cell_type[0, 4, 4] = CELL_SPIKE_LANE
+    p.cell_axis[0, 4, 4] = 1
+    p.safe_offset[0, 4, 4] = -0.48  # Bed on +x, safe lane on -x
+    _set_plan(p, origin=(4, 5), target=(4, 4), heading=3)
+    xy = _grid(8.9, 9.9)
+    wp, _, _ = p._compute_waypoint_and_speed(0, torch.tensor([8.9, 9.9]), -1.57, torch.tensor([4, 5]), xy, torch.zeros(len(xy)))
+    assert abs(float(wp[0]) - 7.52) < 0.05 and float(wp[1]) >= 9.3, f"pre-align point {wp.tolist()} cuts toward the bed"
+    assert bool(p.strafe[0]), "lines up by turning toward the point instead of stepping sideways"
+
+
+def test_no_lane_staging_when_off_lane_on_the_wall_side(monkeypatch):
+    """0.19 m off the safe lane but on the wall side (away from the bed) is safe: no sideways staging (on rough
+    floor the small strafe stalled and triggered the unstuck reflex)."""
+    p = _pilot(monkeypatch)
+    p.cell_type[0, 4, 4] = CELL_SPIKE_LANE
+    p.cell_axis[0, 4, 4] = 1
+    p.safe_offset[0, 4, 4] = -0.48  # Bed on +x, safe lane x = 7.52
+    _set_plan(p, origin=(4, 5), target=(4, 4), heading=3)
+    xy = _grid(7.33, 9.9)  # 0.19 m west of the lane = toward the west wall
+    p._compute_waypoint_and_speed(0, torch.tensor([7.33, 9.9]), -1.57, torch.tensor([4, 5]), xy, torch.zeros(len(xy)))
+    assert not bool(p.strafe[0]), "staging sideways although the robot is on the safe side of the lane"
+
+
+def test_slalom_exit_waypoint_stays_ahead(monkeypatch):
+    """In the slalom's exit lane near the cell border, the waypoint must stay well ahead of the robot (a fixed
+    point at u = 0.95 collapsed onto the robot and made it spin)."""
+    p = _pilot(monkeypatch)
+    p.cell_type[0, 2, 0] = CELL_SPIKE_SLALOM
+    p.cell_axis[0, 2, 0] = 0
+    p.safe_offset[0, 2, 0, 0] = -0.48
+    p.safe_offset[0, 2, 0, 1] = 0.48
+    _set_plan(p, origin=(2, 0), target=(3, 0), heading=0)
+    pos = torch.tensor([4.93, 0.48])  # u = +0.93 in the exit lane
+    xy = _grid(4.93, 0.48)
+    wp, _, _ = p._compute_waypoint_and_speed(0, pos, 0.0, torch.tensor([2, 0]), xy, torch.zeros(len(xy)))
+    assert float(torch.linalg.norm(wp - pos)) > 0.5, f"exit waypoint {wp.tolist()} is on top of the robot"
+
+
+def _speed_at(p: Pilot, x: float, cell: tuple[int, int]) -> float:
+    xy = _grid(x, 0.0)
+    _, speed, _ = p._compute_waypoint_and_speed(0, torch.tensor([x, 0.0]), 0.0, torch.tensor(cell), xy, torch.zeros(len(xy)))
+    return speed
+
+
+def test_trench_crossed_at_trench_speed_then_next_cells_limit(monkeypatch):
+    """Trench in cell (2, 0) (line at x = 4.0), ice after it: TRENCH_SPEED until the pelvis is TRENCH_CLEAR_U past the
+    line, then the ice limit. Coming from rough floor, the rough limit holds until the trench cell."""
+    p = _pilot(monkeypatch)
+    p.cell_type[0, 1, 0], p.cell_type[0, 2, 0], p.cell_type[0, 3, 0] = CELL_ROUGH, CELL_TRENCH, CELL_ICE
+    _set_plan(p, origin=(1, 0), target=(2, 0), heading=0)
+    assert _speed_at(p, 2.6, (1, 0)) == 0.68, "approach on rough floor should keep the rough limit"
+    assert _speed_at(p, 3.7, (2, 0)) == TRENCH_SPEED, "not at trench speed before the trench line"
+    _set_plan(p, origin=(2, 0), target=(3, 0), heading=0)
+    assert _speed_at(p, 4.0 + TRENCH_CLEAR_U - 0.1, (2, 0)) == TRENCH_SPEED, "slowed for the ice before clearing"
+    assert _speed_at(p, 4.0 + TRENCH_CLEAR_U + 0.1, (2, 0)) == 0.55, "ice limit not applied after the trench"
+
+
+def test_trench_speed_both_directions_and_from_plain_floor(monkeypatch):
+    """Walking west across the trench of cell (2, 0): the line is passed going -x. From plain floor the approach
+    already uses TRENCH_SPEED; steep ramps keep their own 0.70 limit."""
+    p = _pilot(monkeypatch)
+    p.cell_type[0, 3, 0], p.cell_type[0, 2, 0], p.cell_type[0, 1, 0] = CELL_PLAIN, CELL_TRENCH, CELL_ROUGH
+    _set_plan(p, origin=(3, 0), target=(2, 0), heading=2)
+    assert _speed_at(p, 5.5, (3, 0)) == TRENCH_SPEED, "approach from plain floor not at trench speed"
+    assert _speed_at(p, 4.3, (2, 0)) == TRENCH_SPEED, "not at trench speed before the line going west"
+    _set_plan(p, origin=(2, 0), target=(1, 0), heading=2)
+    assert _speed_at(p, 4.0 - TRENCH_CLEAR_U - 0.1, (2, 0)) == 0.68, "next cell's limit not applied going west"
+    p.cell_type[0, 2, 0] = CELL_STEEP_RAMP
+    assert _speed_at(p, 4.0, (2, 0)) == 0.70, "steep ramp limit changed"
+
+
+def test_turn_on_ice_is_done_on_the_spot(monkeypatch):
+    """Arriving at an ice corner, a 90 deg turn is done by stopping and rotating, not walked."""
+    p = _pilot(monkeypatch)
+    p.cell_type[0, 2, 0] = CELL_ICE
+    _close_wall(p, 2, 0, 0)  # Corner: east closed, north open
+    _set_plan(p, origin=(1, 0), target=(2, 0), heading=0)
+    ice = lambda xy: torch.full((len(xy),), 0.01)
+    p.act(_obs((3.7, 0.0), ice, t=1.0))
+    assert int(p.ap.heading[0]) == 1, "setup: should turn north"
+    assert int(p.pivot_state[0]) > 0, "90 deg turn on ice was walked instead of done on the spot"
+
+
+def test_ice_turn_brakes_and_rotates_at_the_ice_limits(monkeypatch):
+    """Turning on the spot on ice: brake at PIVOT_BRAKE_ACC_ICE and rotate at up to PIVOT_TURN_RATE_ICE, no faster."""
+    p = _pilot(monkeypatch)
+    p.cell_type[0, 1, 0] = CELL_ICE
+    _set_plan(p, origin=(1, 0), target=(1, 1), heading=1)
+    ice = lambda xy: torch.full((len(xy),), 0.01)
+    p.sim_time = 1.0  # Pivot starts at the first step's time (the brake phase times out after 1.5 s)
+    p._start_pivot(0, 1)  # Facing east, turn north
+    p.ap.cmd[0] = torch.tensor([0.55, 0.0, 0.0])  # Walking at the ice speed limit
+    v_prev, w_peak = 0.55, 0.0
+    for k in range(60):
+        cmd = p.act(_obs((2.0, 0.0), ice, t=1.0 + k * DT, lin_vel=(v_prev, 0.0)))
+        v, vy, w = (float(x) for x in cmd[0])
+        if v_prev > 0.05:
+            assert v_prev - v <= PIVOT_BRAKE_ACC_ICE * DT + 1e-5, f"braking faster than the ice limit ({v_prev} -> {v})"
+            assert v_prev - v >= PIVOT_BRAKE_ACC_ICE * DT - 1e-5 or v == 0.0, f"braking slower than the ice limit ({v})"
+        w_peak = max(w_peak, abs(w))
+        v_prev = max(v, 0.0)  # The robot tracks the command
+    assert int(p.pivot_state[0]) == 3, "never reached the rotate phase"
+    assert abs(w_peak - PIVOT_TURN_RATE_ICE) < 1e-5, f"peak yaw rate on ice {w_peak:.2f} rad/s"
+
+
+def test_no_lane_staging_from_the_centreline(monkeypatch):
+    """Coming along the centreline toward a spike lane is the normal case: keep the usual diagonal pre-alignment
+    (no sideways staging)."""
+    p = _pilot(monkeypatch)
+    p.cell_type[0, 4, 4] = CELL_SPIKE_LANE
+    p.cell_axis[0, 4, 4] = 1
+    p.safe_offset[0, 4, 4] = -0.48
+    _set_plan(p, origin=(4, 5), target=(4, 4), heading=3)
+    xy = _grid(8.0, 9.9)
+    wp, _, _ = p._compute_waypoint_and_speed(0, torch.tensor([8.0, 9.9]), -1.57, torch.tensor([4, 5]), xy, torch.zeros(len(xy)))
+    assert not bool(p.strafe[0]), "staging sideways from the centreline"
+    assert abs(float(wp[1]) - 8.75) < 0.01, f"pre-align point {wp.tolist()} is not the usual u = -0.75 entry point"
