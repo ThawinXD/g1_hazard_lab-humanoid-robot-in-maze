@@ -30,3 +30,4 @@ submissions/.status.lock
 .vscode/settings.json
 .vscode/launch.json
 pyrightconfig.json
+tools/
