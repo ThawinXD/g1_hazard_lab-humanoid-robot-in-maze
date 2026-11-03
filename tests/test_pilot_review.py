@@ -34,6 +34,8 @@ from pilot import (  # noqa: E402
     CELL_TRENCH,
     PIVOT_BRAKE_ACC_ICE,
     PIVOT_TURN_RATE_ICE,
+    RAMP_RUNUP,
+    STEEP_RAMP_SPEED,
     TRENCH_CLEAR_U,
     TRENCH_SPEED,
     Pilot,
@@ -177,7 +179,8 @@ def test_stuck_penalty_still_changes_the_plan(monkeypatch):
     """Review #1: the +15 'stuck' penalty is overwritten by _set_cell_hazard() on the next frame.
 
     Robot at the centre of (1, 0), north wall closed, rough cell (2, 0) ahead. Without a penalty, east costs 11.8
-    and turning back west costs 13.8, so it goes east. After 3.5 s stuck, east should cost 26.8 and lose to west.
+    and turning back west costs 13.8, so it goes east. The first stall 1 m before (2, 0) is a snag on this cell's
+    floor and keeps the plan; after a second stall in the same cell, east should cost 26.8 and lose to west.
     """
     p = _pilot(monkeypatch)
     _close_wall(p, 1, 0, 1)
@@ -187,10 +190,14 @@ def test_stuck_penalty_still_changes_the_plan(monkeypatch):
     p.act(_obs(pos, lambda xy: _rough(xy, 2, 0), t=1.0))
     assert int(p.ap.heading[0]) == 0, "setup: without a penalty the robot should head east"
 
-    p.act(_obs(pos, lambda xy: _rough(xy, 2, 0), t=10.0))  # stuck since t = 0 -> reflex + penalty on (2, 0)
+    p.act(_obs(pos, lambda xy: _rough(xy, 2, 0), t=10.0))  # stuck since t = 0 -> reflex, no penalty yet
     assert float(p.unstuck_until[0]) > 10.0, "setup: the unstuck reflex should have fired"
+    p.act(_obs(pos, lambda xy: _rough(xy, 2, 0), t=10.0 + DT))
+    assert int(p.ap.heading[0]) == 0, "one snag 1 m before an ordinary cell changed the route"
 
-    p.act(_obs(pos, lambda xy: _rough(xy, 2, 0), t=10.0 + DT))  # replans with the penalty
+    p.act(_obs(pos, lambda xy: _rough(xy, 2, 0), t=14.0))  # stuck again in the same cell -> penalty on (2, 0)
+    assert float(p.unstuck_until[0]) > 14.0, "setup: the second unstuck reflex should have fired"
+    p.act(_obs(pos, lambda xy: _rough(xy, 2, 0), t=14.0 + DT))  # replans with the penalty
     assert int(p.ap.heading[0]) != 0, (
         f"still heading east into the cell it got stuck on; its cost is back to "
         f"{float(p.cell_cost[0, 2, 0]):.2f} (the +15 was overwritten when the cell was re-classified)"
@@ -511,9 +518,38 @@ def test_slalom_exit_waypoint_stays_ahead(monkeypatch):
     assert float(torch.linalg.norm(wp - pos)) > 0.5, f"exit waypoint {wp.tolist()} is on top of the robot"
 
 
+def test_stall_blames_target_only_when_it_is_the_obstacle(monkeypatch):
+    """Level 9 seed 5: a snag on a box 0.6 m before a slalom cell put +15 on the slalom and sent the robot back to the
+    long route. Only a ramp / trench the feet reach, the cell the robot is in, or a repeated stall blames the target."""
+    p = _pilot(monkeypatch)
+    _set_plan(p, origin=(1, 0), target=(2, 0), heading=0)  # Target's near edge at x = 3.0
+    p.stall_count[0] = 1
+    here = torch.tensor([1, 0])
+
+    def blames(x: float, cell=here) -> bool:
+        return p._stall_blames_target(0, cell, torch.tensor([x, 0.0]))
+
+    p.cell_type[0, 2, 0] = CELL_SPIKE_SLALOM
+    assert not blames(2.4), "a snag 0.6 m before a slalom blamed the slalom (the level 9 seed 5 case)"
+    assert not blames(2.8), "spike beds never block the robot physically"
+    p.cell_type[0, 2, 0] = CELL_STEEP_RAMP
+    assert not blames(2.4), "ramp blamed although the feet do not reach it"
+    assert blames(2.6), "stalled at the foot of a steep ramp without blaming it"
+    p.cell_type[0, 2, 0] = CELL_ROUGH
+    assert blames(3.5, torch.tensor([2, 0])), "stalled inside the target cell without blaming it"
+    p.stall_count[0] = 2
+    assert blames(2.0), "a repeated stall in the same cell should blame the target"
+
+    p.stall_count[0] = 1  # Walking west: target (0, 0), its near edge at x = 1.0
+    _set_plan(p, origin=(1, 0), target=(0, 0), heading=2)
+    p.cell_type[0, 0, 0] = CELL_STEEP_RAMP
+    assert blames(1.4) and not blames(1.6), "edge distance wrong when walking west"
+
+
 def _speed_at(p: Pilot, x: float, cell: tuple[int, int]) -> float:
     xy = _grid(x, 0.0)
-    _, speed, _ = p._compute_waypoint_and_speed(0, torch.tensor([x, 0.0]), 0.0, torch.tensor(cell), xy, torch.zeros(len(xy)))
+    pos, z = torch.tensor([x, 0.0]), torch.zeros(len(xy))
+    _, speed, _ = p._compute_waypoint_and_speed(0, pos, 0.0, torch.tensor(cell), xy, z)
     return speed
 
 
@@ -532,7 +568,7 @@ def test_trench_crossed_at_trench_speed_then_next_cells_limit(monkeypatch):
 
 def test_trench_speed_both_directions_and_from_plain_floor(monkeypatch):
     """Walking west across the trench of cell (2, 0): the line is passed going -x. From plain floor the approach
-    already uses TRENCH_SPEED; steep ramps keep their own 0.70 limit."""
+    already uses TRENCH_SPEED; steep ramps keep their own STEEP_RAMP_SPEED limit."""
     p = _pilot(monkeypatch)
     p.cell_type[0, 3, 0], p.cell_type[0, 2, 0], p.cell_type[0, 1, 0] = CELL_PLAIN, CELL_TRENCH, CELL_ROUGH
     _set_plan(p, origin=(3, 0), target=(2, 0), heading=2)
@@ -541,7 +577,28 @@ def test_trench_speed_both_directions_and_from_plain_floor(monkeypatch):
     _set_plan(p, origin=(2, 0), target=(1, 0), heading=2)
     assert _speed_at(p, 4.0 - TRENCH_CLEAR_U - 0.1, (2, 0)) == 0.68, "next cell's limit not applied going west"
     p.cell_type[0, 2, 0] = CELL_STEEP_RAMP
-    assert _speed_at(p, 4.0, (2, 0)) == 0.70, "steep ramp limit changed"
+    assert _speed_at(p, 4.0, (2, 0)) == min(STEEP_RAMP_SPEED, p.fast_speed), "steep ramp limit changed"
+
+
+def test_steep_ramp_climbed_fast_after_a_run_up(monkeypatch):
+    """Steep ramp in cell (2, 0), slope foot at x = 3.0 going east. At 0.70 m/s about half the robots stalled on a
+    0.30 m ramp (scripts/trench_test.py --task G1-Ramp-Test), at 0.9-1.1 none: reach STEEP_RAMP_SPEED in the last
+    RAMP_RUNUP before the slope, also from rough floor, keep 0.70 before that and on ice (no speeding up on ice)."""
+    p = _pilot(monkeypatch)
+    fast = min(STEEP_RAMP_SPEED, p.fast_speed)
+    p.cell_type[0, 1, 0], p.cell_type[0, 2, 0], p.cell_type[0, 3, 0] = CELL_ROUGH, CELL_STEEP_RAMP, CELL_PLAIN
+    _set_plan(p, origin=(1, 0), target=(2, 0), heading=0)
+    assert _speed_at(p, 3.0 - RAMP_RUNUP - 0.1, (1, 0)) == 0.70, "sped up on rough floor before the run-up"
+    assert _speed_at(p, 3.0 - RAMP_RUNUP + 0.1, (1, 0)) == fast, "no run-up on the rough floor before the ramp"
+    _set_plan(p, origin=(2, 0), target=(3, 0), heading=0)
+    assert _speed_at(p, 4.0, (2, 0)) == fast, "not at climbing speed on the ramp"
+    p.cell_type[0, 1, 0] = CELL_ICE
+    _set_plan(p, origin=(1, 0), target=(2, 0), heading=0)
+    assert _speed_at(p, 2.8, (1, 0)) == 0.70, "sped up on ice before the ramp"
+    p.cell_type[0, 3, 0] = CELL_PLAIN  # Walking west: the slope foot is at x = 5.0
+    _set_plan(p, origin=(3, 0), target=(2, 0), heading=2)
+    assert _speed_at(p, 5.0 + RAMP_RUNUP - 0.1, (3, 0)) == fast, "no run-up walking west"
+    assert _speed_at(p, 5.0 + RAMP_RUNUP + 0.1, (3, 0)) == 0.70, "run-up too early walking west"
 
 
 def test_turn_on_ice_is_done_on_the_spot(monkeypatch):
@@ -554,6 +611,29 @@ def test_turn_on_ice_is_done_on_the_spot(monkeypatch):
     p.act(_obs((3.7, 0.0), ice, t=1.0))
     assert int(p.ap.heading[0]) == 1, "setup: should turn north"
     assert int(p.pivot_state[0]) > 0, "90 deg turn on ice was walked instead of done on the spot"
+
+
+def test_ice_corner_turn_starts_at_the_ice_edge(monkeypatch):
+    """Just inside an ice corner cell (0.05 m past its border) with its walls known: decide and start braking now, so
+    the robot rotates near the ice edge. Deciding 0.5 m from the centre rotated on the middle of the ice and 5% of those
+    turns fell (scripts/ice_turn_test.py --task G1-Ice-Corner-Test: 0 of 1,000 when braking from the border)."""
+    p = _pilot(monkeypatch)
+    p.cell_type[0, 2, 0] = CELL_ICE
+    p.ap.walls[0, 2, 0] = torch.tensor([1, 0, 0, 1])  # East and south closed, north and west (back) open
+    _set_plan(p, origin=(1, 0), target=(2, 0), heading=0)
+    ice = lambda xy: torch.full((len(xy),), 0.01)
+    p.act(_obs((3.05, 0.0), ice, t=1.0))
+    assert int(p.ap.heading[0]) == 1, "turn not decided on entering the ice corner"
+    assert int(p.pivot_state[0]) > 0, "no turn on the spot started at the ice edge"
+
+    # A slalom after the corner: stopping at the ice edge would leave the robot ~1 m from an outside lane (level 9
+    # seed 3 hit the slalom lining up from there), so the turn waits for the old place, 0.5 m from the centre
+    p = _pilot(monkeypatch)
+    p.cell_type[0, 2, 0], p.cell_type[0, 2, 1] = CELL_ICE, CELL_SPIKE_SLALOM
+    p.ap.walls[0, 2, 0] = torch.tensor([1, 0, 0, 1])
+    _set_plan(p, origin=(1, 0), target=(2, 0), heading=0)
+    p.act(_obs((3.05, 0.0), ice, t=1.0))
+    assert int(p.ap.heading[0]) == 0 and int(p.pivot_state[0]) == 0, "turned at the ice edge before a slalom"
 
 
 def test_ice_turn_brakes_and_rotates_at_the_ice_limits(monkeypatch):

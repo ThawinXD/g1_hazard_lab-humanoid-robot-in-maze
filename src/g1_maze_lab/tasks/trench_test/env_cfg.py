@@ -1,8 +1,10 @@
-"""``G1-Trench-Test``: many G1 robots, each in a walled corridor (maze dimensions) with one trench across it.
+"""Hazard test tasks: many G1 robots, each in a walled corridor (maze dimensions) with one hazard.
 
-Same base config, observations and crash rule as the challenge's maze tasks (``tasks/maze/env_cfg.py``): a G1 Rough
-policy, commands written directly, and torso / pelvis / elbows / palms touching anything (floor or wall) ends the
-episode. ``scripts/trench_test.py`` places the robots and drives them toward the trench.
+``G1-Trench-Test`` (a trench), ``G1-Ramp-Test`` (the maze's ramp), ``G1-Ice-Test`` (one cell of ice) and
+``G1-Ice-Corner-Test`` (an L-shaped corridor turning at an ice cell). Same base config, observations and crash rule as
+the challenge's maze tasks (``tasks/maze/env_cfg.py``): a G1 Rough policy, commands written directly, and torso /
+pelvis / elbows / palms touching anything (floor or wall) ends the episode. ``scripts/trench_test.py`` and
+``scripts/ice_turn_test.py`` place the robots and drive them.
 """
 
 import isaaclab.terrains as terrain_gen
@@ -12,9 +14,18 @@ from isaaclab.utils import configclass
 
 from isaaclab_tasks.core.velocity.config.g1.rough_env_cfg import G1RoughEnvCfg
 
+from ...terrains import HazardTerrainGeneratorCfg, HazardTerrainImporterCfg
 from ..hazard_starter.env_cfg import physics_blowup
 from ..maze import mdp as maze_mdp
-from .terrain import TRENCH_WIDTHS, CorridorTrenchTerrainCfg
+from .terrain import (
+    ICE_CORNER_NEXT,
+    RAMP_HEIGHTS,
+    TRENCH_WIDTHS,
+    CorridorIceCornerTerrainCfg,
+    CorridorIceTerrainCfg,
+    CorridorRampTerrainCfg,
+    CorridorTrenchTerrainCfg,
+)
 
 TILE_SIZE = (8.0, 3.0)  # Corridor tile: 8 m long (trench in the middle), 3 m wide (walls at +-1.0 m)
 NUM_COLS = 20  # Corridors per trench width
@@ -76,3 +87,59 @@ class G1TrenchTestEnvCfg(G1RoughEnvCfg):
         super().play_mode()
         gen.num_rows, gen.num_cols, gen.curriculum = rows, cols, curriculum
         self.scene.terrain.max_init_terrain_level = None
+
+
+@configclass
+class G1RampTestEnvCfg(G1TrenchTestEnvCfg):
+    """Same corridors with the maze's ramp instead of a trench: rows = ramp heights (``RAMP_HEIGHTS``)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        gen = self.scene.terrain.terrain_generator
+        gen.num_rows = len(RAMP_HEIGHTS)
+        gen.sub_terrains = {"corridor_ramp": CorridorRampTerrainCfg(proportion=1.0, heights=RAMP_HEIGHTS)}
+
+
+@configclass
+class G1IceTestEnvCfg(G1TrenchTestEnvCfg):
+    """Same corridors with one maze cell of ice (friction 0.2, the challenge's) instead of a trench; rows are copies."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        old = self.scene.terrain
+        gen = old.terrain_generator
+        self.scene.terrain = HazardTerrainImporterCfg(
+            prim_path=old.prim_path,
+            terrain_type="generator",
+            terrain_generator=HazardTerrainGeneratorCfg(
+                size=gen.size,
+                border_width=gen.border_width,
+                border_height=gen.border_height,
+                num_rows=gen.num_rows,
+                num_cols=gen.num_cols,
+                horizontal_scale=gen.horizontal_scale,
+                vertical_scale=gen.vertical_scale,
+                slope_threshold=gen.slope_threshold,
+                use_cache=False,
+                curriculum=True,
+                sub_terrains={"corridor_ice": CorridorIceTerrainCfg(proportion=1.0)},
+            ),
+            max_init_terrain_level=None,
+            collision_group=old.collision_group,
+            physics_material=old.physics_material,
+            visual_material=old.visual_material,
+            debug_vis=False,
+        )
+
+
+@configclass
+class G1IceCornerTestEnvCfg(G1IceTestEnvCfg):
+    """L-shaped corridors with an ice corner cell; rows = what follows the corner (``ICE_CORNER_NEXT``)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        gen = self.scene.terrain.terrain_generator
+        gen.size = (8.0, 8.0)
+        gen.num_rows = len(ICE_CORNER_NEXT)
+        gen.num_cols = 25
+        gen.sub_terrains = {"corridor_ice_corner": CorridorIceCornerTerrainCfg(proportion=1.0)}

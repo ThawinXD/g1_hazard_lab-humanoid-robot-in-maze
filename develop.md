@@ -228,7 +228,7 @@ the steep ramps.
 
 The controller turns a **waypoint** and a **speed limit** into commands. Normally it turns toward the waypoint
 (`w_z = 1.6 · yaw_err`, capped at 1.1 rad/s, 0.65 on ice), scales `v_x` by `cos²(yaw_err)`, adds a small sideways
-correction `v_y`, and limits acceleration (1.2 m/s², 0.6 on ice).
+correction `v_y`, and limits acceleration (2.0 m/s², raised from 1.2; 0.6 on ice).
 
 **Spike lane** (unchanged idea): hold `v = ±0.48 m` from the centreline, 0.65 m ahead, at 0.48 m/s. The lane is
 pre-aligned from the previous cell.
@@ -265,12 +265,12 @@ speeding up again. The challenge slides (page 20) suggest curves for about 20% s
 Method:
 
 1. **Decide earlier** ([`pilot.py:750`](pilot.py:750)). In plain cells, pick the next cell once the robot is within
-   `TURN_DECIDE_DIST = 0.9 m` of the centre and within 0.45 m of the centreline, but **only when the three sides ahead
+   `TURN_DECIDE_DIST = 1.2 m` of the centre and within 0.45 m of the centreline, but **only when the three sides ahead
    are already known**. Unknown sides are never chosen as open, so deciding before seeing them would bias the choice.
    This doesn't apply near spikes, trenches or steep ramps, or on ice.
 2. **Pure pursuit on the cell path** (`_pursuit_point`, [`pilot.py:653`](pilot.py:653)). The path is the polyline
    *previous centre → corner centre → next centre*. The robot finds its closest point on it (arc length `s`) and aims
-   at the point at `s + PURSUIT_LOOKAHEAD` (0.7 m). Near the corner the lookahead point moves onto the second segment,
+   at the point at `s + PURSUIT_LOOKAHEAD` (1.0 m; first tuned at 0.7 m). Near the corner the lookahead point moves onto the second segment,
    so the robot walks a smooth arc that cuts the corner by a few tenths of a metre, keeping well clear of the inner
    wall corner.
 3. **Speed from curvature.** The curvature to the lookahead point is `κ = 2·|sin(yaw_err)| / d`; the speed is
@@ -301,6 +301,153 @@ runner's 18-minute limit. Three changes:
    Otherwise the stored walls are used. Spike repulsion and slalom logic still read the live scan every step.
 3. **Route cache** (Section 4.4).
 
+### 4.8 Dead ends and turning back on the spot (new)
+
+**Problem.** A robot heading into a dead end walked all the way to its last cell before turning back, for two reasons:
+
+1. Once a target cell was chosen, the pilot only reconsidered it if a wall appeared on the side it was leaving
+   through, a hard hazard appeared in the target, or it arrived. A target found to be closed on three sides triggered
+   none of these.
+2. Walls were only mapped for the current cell and its 4 neighbours, so a dead-end corridor further ahead looked open
+   (the planner treats unknown sides as open) even though the 6 m lidar could see its end.
+
+Turning back was also risky. A reversal was walked as a normal turn: forward speed held at 0.25 m/s while turning at up
+to 1.1 rad/s, which swings the robot about 0.7 m sideways, toward a wall.
+
+No extra dead-end pruning is needed. Once a dead end's walls are in the map, the Bellman-Ford cost-to-goal already
+prices entering it as "go in and come back out", so the planner never chooses it. What was missing was the knowledge
+(fix 2) and the reaction (fix 1).
+
+**Fix 1: re-decide when the route through the target gets worse.**
+- At each decision the pilot stores the chosen target's cost-to-goal (`decided_cost`).
+- Every step, while still in the decision cell, it compares that with the current value from the cached flood fill.
+  If the cost rose by more than `ROUTE_REPLAN_MARGIN = 1.0` (a dead end adds at least 2 cells), it re-decides
+  (`route_surprise`).
+- If the robot is already inside a cell whose three sides ahead are known walls (`dead_end_here`), it decides
+  immediately instead of walking on to the cell's decision point.
+
+**Fix 2: lidar line-of-sight wall mapping** (`_map_walls_from_lidar`). Cell boundaries lie on the lines
+`x = 2k + 1` and `y = 2k + 1`. For each of the 72 lidar rays that hits something within 5.5 m:
+- If the hit point is within 0.12 m of a boundary line (wall face at ±0.075 m), and in the middle part of that cell
+  edge (more than 0.15 m from the corner posts), it votes **wall** for that edge.
+- Every edge interior the ray **crosses** before the hit (and within 4 m) votes **open**.
+
+Votes build up over scans:
+- 3 wall votes latch a wall permanently; walls always win.
+- 2 open votes mark a still-unknown edge open.
+
+Open votes are only cast on flat floor: on a ramp the chest rises and long rays can pass over the 1.0 m walls. Rays
+that miss have no usable angle in `obs` (it comes from an infinite hit point), so only rays that hit something are
+used.
+
+This maps whole corridors several cells ahead. A wrongly marked opening is no worse than unknown for the planner, and a
+wrongly marked wall needs 3 hits sitting exactly on a boundary.
+
+**Fix 3: turn back on the spot** (`_start_pivot`, `_pivot_command`). This maneuver is used for:
+- every turn-back: a decision that reverses the heading, or a heading error above `PIVOT_ENTER_ERR = 2.0 rad`
+- any **90° turn chosen by a replan in the same cell once the robot is near or past the cell centre**
+  (`u_along > −0.5 m`), where there is no room left to walk a curve. In testing, such a late turn on an ice cell swung
+  the robot into a wall, and in another run into a spike bed.
+- **every turn on an ice cell**: a 90° turn walked on ice (friction 0.2) made the robot slip and fall.
+
+It goes through four phases:
+
+| Phase | Command | Ends when |
+|---|---|---|
+| 1 Brake | Forward, sideways and yaw commands down to 0 at up to 2.0 m/s² (0.6 on ice); no turning while still walking. | Command and measured body speed (`lin_vel_b`) are both near zero, or after 1.5 s. |
+| 2 Clear | If any lidar range is below `PIVOT_CLEARANCE = 0.5 m` (elbows reach about 0.3 m), step away at 0.15 m/s along the summed push-away vector of the close rays, with no rotation. Skipped in spike and slalom cells (the lidar can't see cones; the safe lane already keeps 0.45 m from the wall). | Clear of walls, or after 2 s. |
+| 3 Rotate | `v_x = v_y = 0`, `w_z` up to 1.0 rad/s (0.6 on ice). The shortest way round, but for about 180° turns it rotates toward the side with more lidar clearance. The direction is fixed once chosen. If a wall comes closer than 0.4 m, it goes back to Clear. | Heading error below 0.3 rad. |
+| 4 Go | Normal waypoint tracking resumes. | |
+
+While the robot turns on the spot, the 3.5 s anti-stuck timer is paused (standing still is intended here). A full
+turn-back takes about 3–5 s, well under the challenge's 10 s stuck check. Ordinary 90° corners (about 1.3 rad) never
+use this maneuver; they stay curves (Section 4.6).
+
+**Fix 4: stuck-check guard** (`_stuck_guard`). Testing showed a new failure mode. `challenge.py` checks the
+position every 10 s and resets the robot if it moved less than 0.25 m since the previous check, even if it walked
+away and came back in between. In a level 9 run the robot walked 1.7 m forward, turned back on the spot (3.5 s) and was
+0.11 m from its previous check position at t = 20 s, so it was reset to the start.
+
+The check times are fixed (every 10 s of `obs["t"]`), so the pilot handles this itself:
+- It records its position at each check.
+- In the last 1.5 s before the next check, it predicts its position at check time from the current command.
+- If that would be within 0.35 m of the recorded position, it either stops (when it is already far enough away), or
+  moves at 0.35 m/s **along the corridor axis** away from that spot. Moving along the axis keeps any safe lane beside a
+  spike bed.
+
+The guard is skipped during the slalom strafe (moving along the corridor there would reach a bed) and during the
+unstuck reflex.
+
+**Fix 5: no decisions inside the goal cell.** GOAL needs the robot within 0.6 m of the goal cell's centre, but the early
+turn decision (Section 4.6) also fired in the goal cell, so it picked a "next" cell, back out. The old wide U-turn
+happened to swing through the 0.6 m circle; with the turn on the spot the robot ping-ponged between the goal cell and
+its neighbour until the stuck check reset it (level 7 seed 3). Now the robot simply walks to the goal centre.
+
+**Fix 6: line up with a spike lane before reaching the bed.** The spike-lane pre-alignment aimed at the safe lane at
+`u = −0.75`, only 5 cm before the bed starts.
+
+Coming from straight along the corridor that is fine. But after a late turn on an ice corner (level 7 seed 2), the
+robot slid and drifted 0.9 m off the centreline, directly above the bed. Its diagonal approach then clipped the bed's
+near corner.
+
+Now the robot first gets onto the lane at `u = −1.4` (0.7 m before the bed), and only then walks in. This applies
+when it is still more than 1.0 m before the cell centre and **in the bed's half of the corridor** (more than 0.15 m past
+the centreline on the bed's side).
+
+Coming along the centreline (0.48 m off the lane) is the normal case and keeps the usual diagonal approach. A first
+version that also staged from the centreline made every spike-lane approach a slow sideways step, and was less steady.
+
+It moves onto the lane by **stepping sideways while facing down the corridor** (the slalom's strafe mode, with
+forward speed held near zero). A first version turned toward the staging point instead, overshot on ice and hit a
+wall.
+
+Being slightly off the lane on the wall side is safe, so it doesn't trigger staging. On rough floor such a small
+sideways step stalled and set off the unstuck reflex.
+
+**Fix 7: slalom exit waypoint stays ahead.** The slalom's last stage aimed at a fixed point at `u = +0.95`, still
+inside the cell. The robot reached it before crossing into the next cell, the waypoint ended up on top of the robot,
+and the heading error turned into noise (it spun into a wall). Now the exit point is kept 0.8 m ahead of the robot
+(`u` between 0.95 and 1.8), in the exit lane.
+
+**Results.** All runs use `model_8497.pt` and the tuned constants (lookahead 1.0 m, turn decision 1.2 m before the
+centre, `max_acc` 2.0).
+
+Checks with the debug trace:
+- **Lidar height:** the lidar sits at 0.51–0.74 m on flat floor, well below the 1.0 m wall tops.
+- **Map accuracy:** the pilot's wall map was compared with the real maze every 10 s in 11 traced runs, with **no false
+  walls and no false openings**.
+- **Clearance:** every turn-back went brake → (clear) → rotate, and stayed at least 0.72 m from any wall while rotating.
+
+Dead ends, in `auto` mode (which explores more), level 9 seed 2:
+
+| | Old pilot | New pilot |
+|---|---|---|
+| Entries into true dead-end cells | 2 | 0 |
+| Result | 252.8 s, 1 fall | 152.9 s* |
+
+\* In that run, an out-and-back trip led to a false STUCK reset. That was the reason for Fix 4.
+
+8-maze benchmark (`PILOT_MODE=short`), two runs each, because simulator runs vary:
+
+| Maze | Old pilot, run 1 | Old pilot, run 2 | New pilot, run 1 | New pilot, run 2 |
+|---|---|---|---|---|
+| L7 seed 1 | 61.7 s, 0 falls | 61.4 s, 0 | 62.9 s, 0 | 64.2 s, 0 |
+| L7 seed 2 | 95.3 s, 0 | 157.1 s, 1 | 92.9 s, 0 | 90.1 s, 0 |
+| L7 seed 3 | 80.7 s, 0 | 83.7 s, 0 | 80.7 s, 0 | 82.6 s, 0 |
+| L7 seed 4, random ends | 55.1 s, 0 | 54.5 s, 0 | 50.1 s, 0 | 50.4 s, 0 |
+| L9 seed 1 | 113.9 s, 0 | 114.3 s, 0 | 122.4 s, 0 | 121.7 s, 0 |
+| L9 seed 2 | 298.6 s, 1 | 95.1 s, 0 | 245.9 s, 1 ** | 107.5 s, 0 |
+| L9 seed 3 | 105.0 s, 0 | 107.1 s, 0 | 92.8 s, 0 | 92.3 s, 0 |
+| L9 seed 5, random ends | 122.1 s, 0 | 124.4 s, 0 | 87.5 s, 0 | 90.9 s, 0 |
+| **Total** | 932 s, 1 fall | 798 s, 1 fall | 835 s, 1 fall | **700 s, 0 falls** |
+
+\*\* A STUCK reset on the 0.296 m steep ramp in cell (6, 5), the tallest ramp the generator makes. The policy trained
+mostly up to curriculum row about 6.4, and ramps that tall only appear around row 9.9. This is a walking-policy limit;
+the other run crossed the same ramp.
+
+On average the new pilot is **11% faster** (768 s vs 865 s per set) with no more falls. The biggest gains are on mazes
+where the old pilot walked into dead ends or turned in wide arcs (level 9 seeds 3 and 5).
+
 ---
 
 ## 5. Testing
@@ -311,7 +458,7 @@ runner's 18-minute limit. Three changes:
 uv run pytest tests
 ```
 
-60 tests pass. The new ones are:
+75 tests pass. The new ones are:
 
 | Test | Checks |
 |---|---|
@@ -323,6 +470,21 @@ uv run pytest tests
 | `test_planner_does_not_rerun_every_step_toward_a_chosen_hazard` | At most one replan for a hazard that is already known. |
 | `test_robot_past_target_centre_gets_a_new_target` | Re-targets after overshooting a centre. |
 | `test_corner_is_decided_early_and_walked_as_a_curve` | Early decision and a lookahead point around the corner. |
+| `test_dead_end_target_turns_back_before_entering` | A target found to be a dead end is dropped while the robot is still in the previous cell, with a turn-back on the spot. |
+| `test_robot_inside_dead_end_decides_immediately` | Inside a three-wall cell the robot re-targets at once. |
+| `test_lidar_maps_dead_end_corridor` | Ray-cast lidar maps a corridor's far walls (4–5 m away) and its open boundaries; the planner then picks the other way. |
+| `test_reverse_brakes_then_rotates_in_place` | No turning while still walking; then rotation with zero forward and sideways speed. |
+| `test_pivot_steps_away_from_close_wall_first` | A wall 0.3 m ahead makes the robot back away before rotating. |
+| `test_pivot_does_not_trigger_unstuck` | 4.5 s of standing still while turning on the spot doesn't fire the anti-stuck reflex. |
+| `test_normal_corner_does_not_pivot` | 90° corners stay curves. |
+| `test_no_new_target_inside_goal_cell` | Inside the goal cell the target stays the goal (no turning back out). |
+| `test_late_replan_turn_rotates_on_the_spot` | A 90° turn from a replan past the cell centre is done on the spot. |
+| `test_spike_lane_lined_up_before_the_bed_when_far_off_lane` | Far off the safe lane on the bed side, the robot lines up 0.7 m before the bed by stepping sideways, not by aiming at the bed's corner. |
+| `test_no_lane_staging_when_off_lane_on_the_wall_side` | Slightly off the lane on the wall side: no sideways staging. |
+| `test_no_lane_staging_from_the_centreline` | On the centreline: the usual diagonal pre-alignment, no staging. |
+| `test_slalom_exit_waypoint_stays_ahead` | Near the slalom cell's exit border the waypoint stays more than 0.5 m ahead. |
+| `test_turn_on_ice_is_done_on_the_spot` | A 90° turn at an ice corner is done by stopping and rotating. |
+| `test_stuck_guard_moves_off_last_check_position` | Standing at the last check's position just before the next 10 s check, the robot moves away without turning; far from it, the guard stays off. |
 | `test_terrain_curriculum.py` (4 tests) | Circling but walking well → up; fall → down; stuck at a ramp → down; never left the platform → stays. |
 
 ### 5.2 Simulator benchmark
@@ -352,13 +514,13 @@ beds, combined with `CHALLENGE_SHOW_MAZE=1` (prints the real maze) and viewer sn
 
 | Item | Status |
 |---|---|
-| `PILOT_MODE` defaults to `auto` | The runner sets no environment variables. **Change the default to `short` before uploading**, otherwise the pilot avoids the steep ramps the policy can now climb. |
-| Wide U-turns near walls | Not changed. Turning back at speed still uses `min_speed` 0.25 m/s, which swings the robot about 0.7 m sideways. Turning on the spot would be safer (elbows and palms count as a crash). |
-| Wall clearance | The pilot has no body-width model; it relies on lane offsets and curve geometry. |
+| `PILOT_MODE` default | Now `short` in `pilot.py`, which is right for the submission (the runner sets no environment variables). |
+| Wall clearance | The pilot has no body-width model. It relies on lane offsets, curve geometry and, when turning back, the 0.5 m lidar clearance check (Section 4.8). |
 | Death attribution | Only one cell is penalised. A spike hit while the pelvis is still in the cell before the bed penalises the plain cell. A reset in the start cell penalises the target, which can be the other route's entrance. |
 | Partial ramp seen as spikes | A ramp seen at the scan's edge on one side only can briefly be classified as a spike bed until more of it is visible. |
-| False STUCK at the 10 s check | The challenge compares positions 10 s apart. Being back near the same spot by chance (for example right after a spike reset) counts as stuck. |
-| Permanent wall latch | A false wall is never removed. |
+| False STUCK at the 10 s check | Mostly handled by the stuck-check guard (Section 4.8). It can't help when a check falls less than about a second after a reset: the robot starts from rest at the start cell and can't get 0.25 m away in time. |
+| Tallest steep ramps (about 0.29–0.30 m) | The policy sometimes stalls on them (one STUCK reset in 16 benchmark runs). More training on the top curriculum rows would help. |
+| Permanent wall latch | A false wall is never removed. Lidar walls need 3 votes on the same edge, but a false one would still be permanent. |
 | Final level | The final adds a slalom on the long route too, and starts and goals at least 10 cells apart. Slalom handling is the same on either route, but no final-size maze could be run locally (its task folder is released on challenge day). |
 
 ---

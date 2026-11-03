@@ -57,6 +57,10 @@ LIDAR_OPEN_VOTES = 2  # Lidar rays passing through an unknown cell edge needed t
 LIDAR_OPEN_RANGE = 4.0  # Only rays crossing an edge closer than this [m] count as "open" evidence
 TRENCH_SPEED = 0.9  # Speed limit across a trench [m/s] (scripts/trench_test.py: 0.20 m fails 4.5% at 0.7, 1% at 0.9)
 TRENCH_CLEAR_U = 0.5  # Keep TRENCH_SPEED until the pelvis is this far past the trench line [m] (trailing foot over)
+STEEP_RAMP_SPEED = 0.9  # Speed limit up a steep ramp [m/s] (scripts/trench_test.py --task G1-Ramp-Test: 0.30 m ramps
+# crossed 49-59% at 0.7 (the rest stalled on the slope), 99-100% at 0.9 with no falls, 100% restarting halfway up;
+# restarting halfway up at 1.0-1.1 gave 1-2% falls)
+RAMP_RUNUP = 1.0  # ... from this far before its slope [m] (the slope starts at the cell border)
 PIVOT_ENTER_ERR = 2.0  # Turn back on the spot when the heading must change by more than this [rad] (~115 deg)
 PIVOT_EXIT_ERR = 0.3  # Rotation done when the heading error is below this [rad]
 PIVOT_BRAKE_ACC = 2.0  # Deceleration while stopping before a turn-back [m/s^2]
@@ -67,6 +71,7 @@ PIVOT_TURN_RATE_ICE = 0.6  # Same on ice (0.9 tested 2026-11-02: 3 falls while r
 STUCK_CHECK_PERIOD = 10.0  # challenge.py: < 0.25 m moved between checks every 10 s of sim time = STUCK (reset)
 STUCK_GUARD_WINDOW = 1.5  # Look ahead this long before each check [s]
 STUCK_GUARD_DIST = 0.35  # Keep at least this far from the previous check's position at check time [m]
+STUCK_BLAME_DIST = 0.5  # A stall blames a ramp / trench target only when the pelvis is this close to its edge [m]
 
 COSTS_SHORT = {
     CELL_UNKNOWN: 1.05,  # Unexplored cell cost
@@ -178,6 +183,8 @@ class Pilot:
         self.anchor_time = torch.zeros(num_envs, dtype=torch.float32, device=device)  # Time when anchor was updated
         self.unstuck_until = torch.full((num_envs,), -1.0, dtype=torch.float32, device=device)  # End time of unstuck maneuver
         self.unstuck_dir = torch.ones(num_envs, dtype=torch.float32, device=device)  # Alternating +1/-1 turn direction
+        self.stall_cell = torch.full((num_envs, 2), -1, dtype=torch.long, device=device)  # Cell of the last stall
+        self.stall_count = torch.zeros(num_envs, dtype=torch.long, device=device)  # Stalls in a row in that cell
         self.last_wp = self.ap.centre_of(self.last_cell)  # Latest continuous sub-waypoint XY for visualization (N, 2)
         self.prev_heading = torch.zeros(num_envs, dtype=torch.long, device=device)  # Heading before the last decision
         self.on_curve = torch.zeros(num_envs, dtype=torch.bool, device=device)  # True while pure pursuit tracks a turn
@@ -766,10 +773,16 @@ class Pilot:
             centre = (ci if travel_axis == 0 else cj) * self.cell_size  # Trench line along the travel axis
             past = (float(pos[travel_axis].item()) - centre) * travel_sign  # Pelvis past the trench line [m]
             crossing_trench = past < TRENCH_CLEAR_U
+        ramp_runup = False  # In the last RAMP_RUNUP before a steep ramp's slope (not on ice): build up climbing speed
+        if ttype == CELL_STEEP_RAMP and ctype != CELL_ICE:
+            foot = ((ti if travel_axis == 0 else tj) - 0.5 * travel_sign) * self.cell_size  # Slope foot = cell border
+            ramp_runup = (foot - float(pos[travel_axis].item())) * travel_sign < RAMP_RUNUP
         if crossing_trench:
             speed = min(speed, TRENCH_SPEED)  # Cross briskly, whatever comes next: slow robots straddle and fall
-        elif ctype == CELL_STEEP_RAMP or ttype == CELL_STEEP_RAMP:
-            speed = min(speed, 0.70)  # Steady momentum to climb steep ramps
+        elif ctype == CELL_STEEP_RAMP or ramp_runup:
+            speed = min(speed, STEEP_RAMP_SPEED)  # Fast enough not to stall on the slope
+        elif ttype == CELL_STEEP_RAMP:
+            speed = min(speed, 0.70)  # Before the run-up (and on ice before a ramp)
         elif ctype == CELL_ICE or ttype == CELL_ICE:
             speed = min(speed, 0.55)  # Reduced speed on low-friction ice tiles
         elif ctype in (CELL_ROUGH, CELL_LOW_RAMP) or ttype in (CELL_ROUGH, CELL_LOW_RAMP):
@@ -841,6 +854,23 @@ class Pilot:
         if int(cones.sum().item()) < 2:  # No spike bed beside the robot
             return 0.0
         return -1.0 if float(ry[cones].mean().item()) > 0.0 else 1.0  # Opposite side of the cones
+
+    def _stall_blames_target(self, env_id: int, cell: torch.Tensor, pos: torch.Tensor) -> bool:
+        """True when a stall (no progress for 3.5 s) should add the stuck penalty to the target cell.
+
+        Only when the target is what stopped the robot: the robot is already inside it, or it is a ramp / trench whose
+        edge the feet reach (pelvis within STUCK_BLAME_DIST), or the robot stalled twice in the same cell. A snag on
+        the current cell's floor (a loose box) is not the target's fault: penalising the slalom ahead for one made the
+        planner drop the short route for the long one (+100 s, level 9 seed 5 random ends).
+        """
+        ti, tj = int(self.ap.target[env_id, 0].item()), int(self.ap.target[env_id, 1].item())
+        if (int(cell[0].item()), int(cell[1].item())) == (ti, tj) or int(self.stall_count[env_id].item()) >= 2:
+            return True
+        if int(self.cell_type[env_id, ti, tj].item()) not in (CELL_STEEP_RAMP, CELL_LOW_RAMP, CELL_TRENCH):
+            return False
+        step = self.ap._dirs[int(self.ap.heading[env_id].item())].float()  # Unit step toward the target
+        ahead = float(((self.ap.centre_of(self.ap.target[env_id]) - pos) * step).sum().item())  # To its centre [m]
+        return ahead - 0.5 * self.cell_size < STUCK_BLAME_DIST  # Distance to the target's near edge
 
     def _stuck_guard(self, env_id: int, pos: torch.Tensor, yaw: float) -> tuple | None:
         """Avoid a false STUCK reset at challenge.py's 10 s position check, or None when not needed.
@@ -1004,15 +1034,22 @@ class Pilot:
         near_spike_mid = in_spike_cell & (torch.abs(u_along) < 0.30)  # Passing longitudinal center in safe lane
         past_centre = u_along > 0.0  # Already beyond the target centre (e.g. after a slip or wide arc)
         # Early decision in plain cells (so the turn can be walked as a curve): ~0.9 m before the centre, close to the
-        # centreline, and only once the three sides ahead are known (unknown sides are never chosen as open)
+        # centreline, and only once the three sides ahead are known (unknown sides are never chosen as open). Also on
+        # ice, right after entering the cell, so a turn on the spot brakes from the ice edge and rotates just inside it:
+        # deciding 0.5 m from the centre rotated on the middle of the ice, and 5% of those turns fell (9 of 169 in the
+        # maze; scripts/ice_turn_test.py --task G1-Ice-Corner-Test: 7-10% vs 0 of 1,000 braking from the cell border).
+        # Not next to a spike lane / slalom: stopping at the ice edge leaves the robot on the inside of the turn, up to
+        # 1 m from an outside lane, and lining up from there hit the slalom (level 9 seed 3, cell (6, 0))
         env_ar = torch.arange(self.num_envs, device=self.device)
         cell_walls = self.ap.walls[env_ar, cell[:, 0], cell[:, 1]]  # (N, 4) walls of the current cell
         back = (self.ap.heading + 2) % 4  # Side we came in through
         ahead_known = ((cell_walls != -1) | (torch.arange(4, device=self.device).unsqueeze(0) == back.unsqueeze(1))).all(dim=1)
         lateral = torch.abs(rel_centre[:, 0] * dir_vec[:, 1] - rel_centre[:, 1] * dir_vec[:, 0])  # Off-centreline [m]
-        early = (
-            ~cautious_cell & (cur_type != CELL_ICE) & ahead_known & (u_along > -TURN_DECIDE_DIST) & (lateral < 0.45)
-        )
+        nb = (cell.unsqueeze(1) + self.ap._dirs.unsqueeze(0)).clamp(0, self.num_cells - 1)  # (N, 4, 2) neighbour cells
+        nb_type = self.cell_type[env_ar.unsqueeze(1), nb[..., 0], nb[..., 1]]  # (N, 4) their hazard types
+        spikes_next = ((nb_type == CELL_SPIKE_LANE) | (nb_type == CELL_SPIKE_SLALOM)).any(dim=1)
+        ice_wait = (cur_type == CELL_ICE) & spikes_next  # Turn at the old place (0.5 m from the centre) there
+        early = ~cautious_cell & ~ice_wait & ahead_known & (u_along > -TURN_DECIDE_DIST) & (lateral < 0.45)
         # Already inside a dead end (the three sides ahead are walls): decide now instead of walking to its centre
         side_ids = torch.arange(4, device=self.device).unsqueeze(0)
         ahead_walls = (cell_walls == 1) | (side_ids == back.unsqueeze(1))
@@ -1098,8 +1135,12 @@ class Pilot:
                 self.unstuck_dir[b] = away if away != 0.0 else -self.unstuck_dir[b]
                 self.pos_anchor[b] = pos_xy[b]  # Reset anchor position
                 self.anchor_time[b] = self.sim_time  # Reset anchor time
-                ti, tj = int(self.ap.target[b, 0].item()), int(self.ap.target[b, 1].item())  # Blocking target cell
-                if (ti, tj) != self.start_cell and (ti, tj) != self.goal_cell:
+                same_cell = bool((self.stall_cell[b] == cell[b]).all())  # Stalled in this cell before?
+                self.stall_count[b] = self.stall_count[b] + 1 if same_cell else 1
+                self.stall_cell[b] = cell[b]
+                ti, tj = int(self.ap.target[b, 0].item()), int(self.ap.target[b, 1].item())  # Target cell
+                blame = self._stall_blames_target(b, cell[b], pos_xy[b])
+                if blame and (ti, tj) != self.start_cell and (ti, tj) != self.goal_cell:
                     self.cell_penalty[b, ti, tj] += 15.0  # Remember penalty (survives re-classification)
                     self.cell_cost[b, ti, tj] += 15.0  # Penalize blocking cell so planner considers alternatives
                 self.ap.need_decision[b] = True  # Replan immediately after unstuck maneuver
@@ -1244,6 +1285,8 @@ class Pilot:
         self.last_wp[env_ids] = self.ap.centre_of(start)  # Reset visualized waypoint to start cell center
         self.anchor_time[env_ids] = self.sim_time  # Reset anti-stuck timer
         self.unstuck_until[env_ids] = -1.0  # Clear any active unstuck reflex
+        self.stall_cell[env_ids] = -1  # Forget stalls before the reset
+        self.stall_count[env_ids] = 0
 
     # ------------------------------------------------------------------
     # 5. Telemetry & Route Visualization Helpers
