@@ -33,8 +33,11 @@ from pilot import (  # noqa: E402
     CELL_STEEP_RAMP,
     CELL_TRENCH,
     PIVOT_BRAKE_ACC_ICE,
+    ICE_SLOW_DIST,
+    PIVOT_ROUGH_EXIT,
     PIVOT_TURN_RATE_ICE,
     RAMP_RUNUP,
+    ROUGH_SPEED,
     STEEP_RAMP_SPEED,
     TRENCH_CLEAR_U,
     TRENCH_SPEED,
@@ -400,6 +403,44 @@ def test_reverse_brakes_then_rotates_in_place(monkeypatch):
     assert rotated, "never rotated on the spot"
 
 
+def _turn_back_from_rough(monkeypatch, here: int, ahead: int):
+    """Walk east through (1, 0) (type ``here``) toward the dead end (2, 0) (type ``ahead``) at 0.8 m/s, the robot
+    following the command; returns [(x, v, w)] per step after the turn-back is decided at x = 2.6."""
+    p = _pilot(monkeypatch)
+    flat = lambda xy: torch.zeros(len(xy))
+    z_fn = (lambda xy: _rough(xy, 1, 0)) if here == CELL_ROUGH else flat
+    _set_plan(p, origin=(1, 0), target=(2, 0), heading=0)
+    p.act(_obs((2.6, 0.0), z_fn, t=1.0, lin_vel=(0.8, 0.0)))
+    p.ap.cmd[0] = torch.tensor([0.8, 0.0, 0.0])
+    _dead_end_east_of_1_0(p)
+    p.ap.walls[0, 1, 0, 0] = p.ap.walls[0, 2, 0, 2] = 0  # (1, 0) -> (2, 0) is a known opening
+    x, v_prev, out = 2.6, 0.8, []
+    for k in range(250):
+        p.cell_type[0, 1, 0], p.cell_type[0, 2, 0] = here, ahead
+        cmd = p.act(_obs((x, 0.0), z_fn, t=1.02 + k * DT, lin_vel=(v_prev, 0.0)))
+        v, _, w = (float(c) for c in cmd[0])
+        out.append((x, v, w))
+        x += max(v, 0.0) * DT
+        v_prev = max(v, 0.0)
+    return out
+
+
+def test_turn_back_in_rough_cell_rotates_on_the_plain_cell_ahead(monkeypatch):
+    """Level 7 seed 2: the dead end (5, 0) is found from the rough cell (4, 0), 0.5 m before its border. Rotating on
+    the loose boxes moved the robot up to 1 m (into the wall once). Walk on into the plain cell, brake from
+    PIVOT_ROUGH_EXIT past the border and rotate there; on plain floor, or before a hazard cell, brake at once."""
+    steps = _turn_back_from_rough(monkeypatch, CELL_ROUGH, CELL_PLAIN)
+    line = 3.0 + PIVOT_ROUGH_EXIT
+    for x, v, w in steps:
+        if x < line - 0.02:
+            assert v >= 0.4 - 1e-6 and abs(w) < 0.05, f"braking or turning at x = {x:.2f} before the plain cell"
+    rotating = [x for x, v, w in steps if abs(w) > 0.4]
+    assert rotating and min(rotating) > 3.0, "did not rotate on the plain cell"
+    for here, ahead in ((CELL_PLAIN, CELL_PLAIN), (CELL_ROUGH, CELL_SPIKE_LANE)):
+        x, v, w = _turn_back_from_rough(monkeypatch, here, ahead)[5]
+        assert v < 0.7 and x < 2.8, f"did not brake at once (cell types {here} -> {ahead})"
+
+
 def test_pivot_steps_away_from_close_wall_first(monkeypatch):
     """Turning back 0.3 m from a wall: step away from it (no rotation) before rotating."""
     p = _pilot(monkeypatch)
@@ -447,6 +488,21 @@ def test_stuck_guard_moves_off_last_check_position(monkeypatch):
     v, vy, w = (float(x) for x in cmd[0])
     assert math.hypot(v, vy) > 0.2 and abs(w) < 0.05, f"command ({v:+.2f}, {vy:+.2f}, {w:+.2f}) does not move away"
     assert p._stuck_guard(0, torch.tensor([4.0, 0.0]), 0.0) is None, "guard active although far from the check position"
+
+
+def test_stuck_guard_sees_a_snagged_robot(monkeypatch):
+    """Level 7 seed 2: walking back from a dead end, the robot snagged on a box 0.2 m from where the previous 10 s
+    check saw it, still commanded 0.9 m/s. Predicted from the command it would be 1 m away by the next check, so the
+    guard woke too late; predicted from the measured (zero) velocity it must act at once, 1.2 s before the check."""
+    p = _pilot(monkeypatch)
+    _set_plan(p, origin=(1, 0), target=(0, 0), heading=2)
+    flat = lambda xy: torch.zeros(len(xy))
+    p.act(_obs((2.2, 0.0), flat, t=10.0, yaw=math.pi, lin_vel=(0.9, 0.0)))  # Check at t = 10 s records this position
+    p.ap.cmd[0] = torch.tensor([0.9, 0.0, 0.0])
+    p.sim_time = 18.8  # 1.2 s before the t = 20 s check
+    assert p._stuck_guard(0, torch.tensor([2.4, 0.0]), math.pi) is None, "setup: commanded speed predicts clearance"
+    guard = p._stuck_guard(0, torch.tensor([2.4, 0.0]), math.pi, torch.tensor([0.0, 0.0, 0.0]))
+    assert guard is not None and math.hypot(guard[0], guard[1]) > 0.2, "guard idle although the robot is not moving"
 
 
 def test_no_new_target_inside_goal_cell(monkeypatch):
@@ -547,8 +603,12 @@ def test_stall_blames_target_only_when_it_is_the_obstacle(monkeypatch):
 
 
 def _speed_at(p: Pilot, x: float, cell: tuple[int, int]) -> float:
-    xy = _grid(x, 0.0)
-    pos, z = torch.tensor([x, 0.0]), torch.zeros(len(xy))
+    return _speed_at_xy(p, (x, 0.0), cell)
+
+
+def _speed_at_xy(p: Pilot, pos_xy: tuple[float, float], cell: tuple[int, int]) -> float:
+    xy = _grid(*pos_xy)
+    pos, z = torch.tensor(pos_xy), torch.zeros(len(xy))
     _, speed, _ = p._compute_waypoint_and_speed(0, pos, 0.0, torch.tensor(cell), xy, z)
     return speed
 
@@ -559,7 +619,10 @@ def test_trench_crossed_at_trench_speed_then_next_cells_limit(monkeypatch):
     p = _pilot(monkeypatch)
     p.cell_type[0, 1, 0], p.cell_type[0, 2, 0], p.cell_type[0, 3, 0] = CELL_ROUGH, CELL_TRENCH, CELL_ICE
     _set_plan(p, origin=(1, 0), target=(2, 0), heading=0)
-    assert _speed_at(p, 2.6, (1, 0)) == 0.68, "approach on rough floor should keep the rough limit"
+    assert _speed_at(p, 2.6, (1, 0)) == 0.68, "rough floor before a trench should keep 0.68 (2 falls in 6 at 0.9)"
+    p.cell_type[0, 0, 0] = CELL_PLAIN  # Toward the rough cell from plain floor: already 0.68, no 0.9 -> 0.68 -> 0.9
+    _set_plan(p, origin=(0, 0), target=(1, 0), heading=0)
+    assert _speed_at(p, 0.6, (0, 0)) == 0.68, "sped up toward a rough cell that leads straight into a trench"
     assert _speed_at(p, 3.7, (2, 0)) == TRENCH_SPEED, "not at trench speed before the trench line"
     _set_plan(p, origin=(2, 0), target=(3, 0), heading=0)
     assert _speed_at(p, 4.0 + TRENCH_CLEAR_U - 0.1, (2, 0)) == TRENCH_SPEED, "slowed for the ice before clearing"
@@ -575,7 +638,8 @@ def test_trench_speed_both_directions_and_from_plain_floor(monkeypatch):
     assert _speed_at(p, 5.5, (3, 0)) == TRENCH_SPEED, "approach from plain floor not at trench speed"
     assert _speed_at(p, 4.3, (2, 0)) == TRENCH_SPEED, "not at trench speed before the line going west"
     _set_plan(p, origin=(2, 0), target=(1, 0), heading=2)
-    assert _speed_at(p, 4.0 - TRENCH_CLEAR_U - 0.1, (2, 0)) == 0.68, "next cell's limit not applied going west"
+    rough = min(ROUGH_SPEED, p.fast_speed)
+    assert _speed_at(p, 4.0 - TRENCH_CLEAR_U - 0.1, (2, 0)) == rough, "next cell's limit not applied going west"
     p.cell_type[0, 2, 0] = CELL_STEEP_RAMP
     assert _speed_at(p, 4.0, (2, 0)) == min(STEEP_RAMP_SPEED, p.fast_speed), "steep ramp limit changed"
 
@@ -599,6 +663,42 @@ def test_steep_ramp_climbed_fast_after_a_run_up(monkeypatch):
     _set_plan(p, origin=(3, 0), target=(2, 0), heading=2)
     assert _speed_at(p, 5.0 + RAMP_RUNUP - 0.1, (3, 0)) == fast, "no run-up walking west"
     assert _speed_at(p, 5.0 + RAMP_RUNUP + 0.1, (3, 0)) == 0.70, "run-up too early walking west"
+
+
+def test_rough_floor_limit_is_its_own(monkeypatch):
+    """Rough cells (in or into) get ROUGH_SPEED (scripts/rough_test.py: slower robots snag more); low ramps keep 0.68,
+    and ice, before or after the rough cell, keeps its 0.55."""
+    p = _pilot(monkeypatch)
+    rough = min(ROUGH_SPEED, p.fast_speed)
+    p.cell_type[0, 1, 0], p.cell_type[0, 2, 0], p.cell_type[0, 3, 0] = CELL_PLAIN, CELL_ROUGH, CELL_PLAIN
+    _set_plan(p, origin=(1, 0), target=(2, 0), heading=0)
+    assert _speed_at(p, 2.6, (1, 0)) == rough, "approach to a rough cell not at the rough limit"
+    _set_plan(p, origin=(2, 0), target=(3, 0), heading=0)
+    assert _speed_at(p, 4.0, (2, 0)) == rough, "not at the rough limit inside the rough cell"
+    p.cell_type[0, 3, 0] = CELL_LOW_RAMP
+    assert _speed_at(p, 4.0, (2, 0)) == 0.68, "rough cell before a low ramp should keep the low-ramp limit"
+    p.cell_type[0, 3, 0] = CELL_ICE  # Ice edge at x = 5.0
+    assert _speed_at(p, 5.0 - ICE_SLOW_DIST - 0.1, (2, 0)) == rough, "slowed for the ice too early on the boxes"
+    assert _speed_at(p, 5.0 - ICE_SLOW_DIST + 0.1, (2, 0)) == 0.55, "not at the ice limit just before the ice"
+    p.cell_type[0, 2, 0] = CELL_PLAIN
+    assert _speed_at(p, 4.0, (2, 0)) == 0.55, "plain floor before ice should keep the ice limit"
+    p.cell_type[0, 1, 0], p.cell_type[0, 2, 0] = CELL_ICE, CELL_ROUGH
+    _set_plan(p, origin=(1, 0), target=(2, 0), heading=0)
+    assert _speed_at(p, 2.6, (1, 0)) == 0.55, "sped up on ice before a rough cell"
+
+
+def test_rough_corner_into_ice_keeps_rough_speed_until_the_ice(monkeypatch):
+    """Level 7 seed 2: rough corner (3, 5) turning from north to east into ice (4, 5). Walked at the ice limit, the
+    robot stumbled at the end of the turn, 0.56-0.67 m before the ice: the corner keeps ROUGH_SPEED (its curve speed
+    limit still applies) and slows only within ICE_SLOW_DIST of the ice edge (x = 7.0, along the new heading)."""
+    p = _pilot(monkeypatch)
+    rough = min(ROUGH_SPEED, p.fast_speed)
+    p.cell_type[0, 3, 5], p.cell_type[0, 4, 5] = CELL_ROUGH, CELL_ICE
+    _set_plan(p, origin=(3, 5), target=(4, 5), heading=0)
+    p.prev_heading[0] = 1  # Came in heading north
+    assert _speed_at_xy(p, (5.95, 9.2), (3, 5)) == rough, "slowed for the ice at the start of the corner"
+    assert _speed_at_xy(p, (6.4, 9.7), (3, 5)) == rough, "slowed where the robot stumbled (0.6 m before the ice)"
+    assert _speed_at_xy(p, (6.75, 9.9), (3, 5)) == 0.55, "not at the ice limit 0.25 m before the ice"
 
 
 def test_turn_on_ice_is_done_on_the_spot(monkeypatch):

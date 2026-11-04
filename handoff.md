@@ -9,8 +9,10 @@ Use this file to pick the work up in a new session. The full write-up of methods
 |---|---|
 | Walking policy | `logs/rsl_rl/g1_hazard_pro/2026-10-31_17-46-45_skill_curr1500/model_8497.pt`. Trained with the fixed terrain curriculum (`terrain_levels_skill`). Climbs ramps up to about 0.28 m and crosses trenches. **`logs/` is git-ignored, so this file exists only on this machine. Back it up**, for example by copying it to `pretrained/`. |
 | Pilot | [pilot.py](pilot.py), 1,348 lines. Includes the dead-end fix, lidar wall mapping, turn-back on the spot, stuck-check guard and the fixes found in testing (develop.md §4.8), plus (2026-11-02) trench crossing at 0.9 m/s and the stall-blame rule (section 5, item 7), and (2026-11-03) steep ramps climbed at 0.9 m/s after a 1 m run-up (section 3, "Ramp test") and ice turns decided at the ice edge (section 3, "Ice turn test"). The 2026-11-03 spike-entry and rough-floor turn experiments were reverted (section 3, "Spike-lane corners"; section 4). |
-| Tests | `uv run pytest tests`: **87 pass** (no simulator needed). |
-| Git | Branch `side-test`. Everything through the 2026-11-03 ramp and ice-turn work is committed (`git log` for the latest commit; `tools/` and `logs/` are git-ignored, so the checkpoint is not in git). Ask before committing. |
+| Training setup | `G1-Hazard-Challenge` (real ice, pilot-like commands, sideways reward, harder hazards) plus the sideways and rough-floor tests, built 2026-11-03 and **not trained yet** (section 3, "Policy training setup"). Challenge day: Saturday 2026-11-14. |
+| Pilot changes (2026-11-04) | In the working tree, **not committed**: rough-floor speed 0.9 (`ROUGH_SPEED`), turn-backs moved off rough floor (`PIVOT_ROUGH_EXIT`), rough corners into ice at rough speed (`ICE_SLOW_DIST`), the old 0.68 before trenches, and the stuck guard using measured velocity. Benchmark **638.7 s and 641.0 s, 0 falls** (bar 685 / 685); residual risk at L9 seed 2's trench (section 3, "Rough corners into ice, trench approach, stuck guard"). |
+| Tests | `uv run pytest tests`: **103 pass** (no simulator needed). |
+| Git | Branch `side-test`. Everything through the 2026-11-03 ramp and ice-turn work is committed (`git log` for the latest commit; `tools/` and `logs/` are git-ignored, so the checkpoint is not in git). The training setup is not committed yet. Ask before committing. |
 | Submission | Upload `model_8497.pt` as `policy.pt` plus `pilot.py`. `PILOT_MODE` already defaults to `short` (the runner sets no env vars). |
 
 ### Latest benchmark (two runs each; simulator runs vary)
@@ -63,6 +65,10 @@ Other important files:
 - `scripts/challenge.py`: the official runner and rules. **Don't change the rules.**
 - `src/g1_maze_lab/tasks/curriculum/mdp/curriculums.py`: the `terrain_levels_skill` curriculum term.
 - `src/g1_maze_lab/tasks/hazard_starter/env_cfg.py`: the training terrain and task `G1-Hazard-Pro`.
+- `src/g1_maze_lab/tasks/hazard_challenge/`: task `G1-Hazard-Challenge` (`terrain.py` ice tile and harder hazards,
+  `mdp/commands.py` pilot-like commands, `mdp/rewards.py` sideways reward).
+- `src/g1_maze_lab/tasks/trench_test/` + `scripts/{trench,ice_turn,rough,strafe}_test.py`: policy tests in walled
+  corridors (trench, ramp, ice, rough floor) and on open floor (sideways steps, drift).
 - `tests/test_pilot_review.py`: regression tests for every pilot fix, with synthetic scan, lidar (`_lidar`
   ray-caster) and wall (`_walls_z`) helpers.
 
@@ -287,6 +293,154 @@ Two findings about the 685 s version's entry still apply:
 - **A reset just before a 10 s STUCK check counts twice.** The check compares with the position 10 s earlier, which may
   be the same start (L7 seed 4: an ice fall at 9.8 s, then a STUCK at 10.0 s).
 
+### Policy training setup (2026-11-03, built, not trained yet)
+
+**The policy never trained on ice.** `G1-Hazard-Pro` randomizes foot friction 0.2–1.0 to cover ice, but Newton's
+MuJoCo solver uses the *larger* friction of two touching shapes (the reason the maze's ice needs `mjc:priority`), and
+the training floor is 1.0. Simulator check (`G1-Ice-Test`, `model_8497`, 100 robots per group): on the floor, feet at
+0.2 behave exactly like feet at 1.0 (foot slip in contact 0.073 vs 0.073 m/s standing, 0.099 vs 0.102 m/s turning
+at 1 rad/s); on the maze's ice the feet slip at 0.42–0.64 m/s.
+
+**New task `G1-Hazard-Challenge`** ([src/g1_maze_lab/tasks/hazard_challenge/](src/g1_maze_lab/tasks/hazard_challenge/)):
+`G1-Hazard-Pro` (same observations, network, PPO settings, curricula and terminations) plus:
+1. **Real ice:** the box tile's every-other-cell plates are maze ice (friction 0.2 with `mjc:priority`, through
+   `HazardTerrainGenerator` / `HazardTerrainImporter`), no boxes on them. Foot friction is fixed at 1.0 (the old
+   randomization had no effect).
+2. **Pilot-like commands** (`PilotLikeVelocityCommand`): measured over the 16 latest benchmark runs, the pilot sends
+   41% slow straight walking (training had 9%), 25% slow turning, 24% fast walking (training: 37%, mostly while
+   turning), 5% turning on the spot (33% of the time on ice), 3% sideways (37% of slalom time). The new term picks a
+   kind per robot: slow 30%, slow turning 20%, fast 15%, rotate on the spot 10%, sideways 10% (0.25–0.5 m/s), stand
+   5%, fully random 10%; holds it 2–6 s (was 10 s) and ramps the command with the pilot's acceleration limits
+   (2 m/s², 2.8 rad/s²) from zero at every episode start.
+3. **Sideways speed reward** `track_lin_vel_y_exp` (std 0.2, weight 0.5). `track_lin_vel_xy_exp` (std 0.5) is
+   unchanged because `terrain_levels_skill` promotes by it.
+4. **Harder hazards:** trenches 0.10–0.26 m (was 0.06–0.24), ramps 0.12–0.32 m (was 0.08–0.30). At the curriculum's
+   average row (6.4) that is about 0.21 m / 0.26 m instead of 0.18 / 0.23 m.
+
+Smoke run of the training config with `model_8497` acting (256 robots, 45 s, no training): 240 ice tiles, 9.3% of
+robot time on ice (the maze: about 10%), foot slip 0.53 m/s on ice vs 0.095 off it, command kinds at their weights,
+all four curricula logging. `model_8497` fell 38 times on ice and 16 times elsewhere, with ten times less time on ice.
+
+Planned runs (each about 25 min per 1,500 iterations here):
+
+```bash
+uv run isaaclab train --rl_library rsl_rl --task G1-Hazard-Challenge --num_envs 1024 --checkpoint logs/rsl_rl/g1_hazard_pro/2026-10-31_17-46-45_skill_curr1500/model_8497.pt agent.max_iterations=1500 agent.run_name=from8497
+uv run isaaclab train --rl_library rsl_rl --task G1-Hazard-Challenge --num_envs 1024 --checkpoint pretrained/hazard_starter/model_5600.pt agent.max_iterations=3000 agent.run_name=from5600
+```
+
+Watch `Curriculum/terrain_levels` in TensorBoard: ice and harder commands lower the tracking reward that promotion
+needs (75%). If the average row is still below about 5 after 500 iterations, lower the ice share or the threshold.
+A new checkpoint replaces `model_8497` only if it is at least as good on the trench, ramp and ice tests and the
+benchmark has no new falls and is not slower. Expect to retune some pilot limits for it.
+
+**Sideways test** ([scripts/strafe_test.py](scripts/strafe_test.py), task `G1-Strafe-Test`: open flat floor, 500
+robots, commands ramped in like the pilot's). `model_8497` (125 robots per row, 0 falls):
+
+| Command | Reached | Drift |
+|---|---|---|
+| left 0.20 / 0.35 / 0.50 m/s | 0.13 / 0.22 / 0.30 m/s (61–66%) | creeps forward 0.08–0.10 m/s, turns left 4–5°/s |
+| right 0.20 / 0.35 / 0.50 m/s | 0.10 / 0.18 / 0.27 m/s (48–54%) | forward 0.03–0.04 m/s, turns left 3°/s |
+| straight 0.5 / 1.0 m/s | 0.45 / 0.88 m/s (87–89%) | 8.9 / 12.8 cm left per metre, heading +1.5 / +2.3°/m |
+
+**Rough-floor test** ([scripts/rough_test.py](scripts/rough_test.py), task `G1-Rough-Test`: walled corridors of maze
+rough cells, the same boxes every run; straight, lineup (the lane moves 0.48 m sideways 2 m in), and L corners
+turning left / right; steered like the pilot's normal tracking). Snag = under 0.1 m progress along the lane in 1 s.
+`model_8497`, 250 robots per row and speed:
+
+| Speed | Finished | Fell | Robots that snagged | Time stalled per robot |
+|---|---|---|---|---|
+| 0.50 m/s | 84–97% | 0.4–4.0% | 46–56% | 1.0–2.0 s |
+| 0.68 m/s (pilot's rough limit) | 98–100% | 0–1.6% | 20–28% | 0.3–0.4 s |
+| 0.90 m/s | 100% | 0% | 4–8% | 0.02–0.07 s |
+
+Like trenches and ramps, **slower is worse on rough floor**: at 0.9 m/s the robots snag a quarter as often as at the
+pilot's 0.68 and none fell (corners included, turning at up to 1.1 rad/s like the pilot).
+
+**Rough floor at 0.9 m/s in the maze (2026-11-04, in the working tree, not committed).** `ROUGH_SPEED = 0.9` in a
+rough cell or into one; low ramps keep 0.68, and ice (before or after) keeps 0.55, because the ice branch comes first.
+Traced benchmark:
+
+| Maze | Run 1 | Run 2 | Extra runs |
+|---|---|---|---|
+| L7 seed 1 | 59.4 | 59.8 | |
+| L7 seed 2 | 86.4 | 98.1 (spike hit) | 89.2 (fall), 87.2, 83.7 (fall), 85.9 |
+| L7 seed 3 | 78.7 | 78.3 | |
+| L7 seed 4, random ends | 46.2 | 45.7 | |
+| L9 seed 1 | 116.0 | 115.8 | |
+| L9 seed 2 | 89.2 | 88.0 | |
+| L9 seed 3 | 84.4 | 83.8 | |
+| L9 seed 5, random ends | 85.2 | 291.3 (fall) | 79.9, 82.5, 81.5, 83.2 |
+| **Total** | **645.5 s, 0 falls** | 860.8 s, 2 falls | |
+
+- **Clean runs are faster everywhere:** about 33 s per set (645.5 vs 678.6 s), 3–7 s per maze. Mean speed on rough
+  cells 0.59 m/s (was 0.50). Stalls of 1 s or more: 1 in 24 runs, 2.4 s (was 4 in 16 runs, 8.0 s).
+- **Every fall was at a rough corner turning into ice, or just after one.** Three were stumbles in the rough cell
+  while curving into the ice cell, at the ice approach limit of 0.55 m/s: L7 seed 2 (3, 5) twice (also the baseline's
+  one fall, and 2 of 3 runs before that), and L9 seed 5 (6, 4) once (not seen in 8 earlier runs; the robot came into
+  that cell at 0.86 m/s and braked to 0.55 in the corner). The fourth, the L7 seed 2 spike hit, followed the same
+  corner: the robot headed for (5, 5), turned back late at the east edge of ice cell (4, 5), stepped sideways beside
+  the bed and hit it turning toward the lane. Baseline runs do the same manoeuvre there (unchanged code).
+- **What the 0.9 limit leaves out:** a rough cell whose next cell is ice is still driven at 0.55 m/s, the speed at
+  which the rough test snags about half the robots. Next step: keep `ROUGH_SPEED` through such a rough cell and slow
+  to 0.55 only just before the ice edge.
+- **One fall can cost 200+ s:** after L9 seed 5's fall the planner abandoned the short route, wandered nearby
+  cells, then drove the whole long route (section 5, item 4).
+
+Not yet at the bar's "no new falls": keep it only together with the rough-before-ice fix, after a new benchmark.
+
+**Turn-backs on rough floor (2026-11-04, in the working tree, not committed).** The user saw level 7 seed 2 crash
+into a wall after turning back from the dead end at (5, 0). The dead end is found from the rough cell (4, 0), 0.5 m
+before its border, and the robot turned on the spot right there, on the loose boxes. Over all traces, turns on the
+spot moved the robot 0.26 m on average on rough floor and over 0.3 m in 32% of 133 turns (chest bobbing, feet on
+boxes), against 0.11 m and none of 84 on plain floor. At (4, 0) the robot moved 0.3–1.0 m in every run, came within
+0.23–0.75 m of a wall, and crashed once.
+- **Fix (`PIVOT_ROUGH_EXIT = 0.35`, `_plan_rough_exit`):** a turn-back decided in a rough cell, past its centre and
+  facing the way it walked, keeps walking into the cell ahead when that is plain floor behind a known opening. It
+  brakes from 0.35 m past the border and rotates there. Otherwise it brakes at once, as before.
+- **Result (20 traced runs):** all 6 level 7 seed 2 runs rotated on (5, 0) at x = 9.7–9.8, moving about 0.1 m, with
+  the nearest wall 0.82–0.84 m away. Rough-floor turns on the spot went from 23 in 24 runs to 4 in 20 (left: L9
+  seed 5 (5, 5) and L7 seed 4 (4, 4), where the cell ahead isn't plain). Cost: L7 seed 2 is about 3 s slower (walks
+  ~0.8 m further and back); a smaller `PIVOT_ROUGH_EXIT` could cut that.
+- **Benchmark with both changes:** 698.9 s and 708.7 s, 1 fall each. Neither fall touches the turn-back code: a turn
+  on the spot on ice at L9 seed 3 (6, 0) (an ice cell next to the slalom, which keeps the old turn point), and a
+  stumble on the 0.20 m trench line at L9 seed 2 (4, 0), crossed at 0.9 m/s coming from rough floor (that approach is
+  0.9 instead of 0.68 because of `ROUGH_SPEED`). One extra L7 seed 2 run fell on ice (4, 5) right after the rough
+  corner (3, 5).
+
+**Rough corners into ice, trench approach, stuck guard (2026-11-04, in the working tree, not committed).** Three more
+changes on top of the two above, each benchmarked:
+1. **Rough cell before ice (`ICE_SLOW_DIST = 0.4`):** keep `ROUGH_SPEED` (the corner's curve limit still applies) and
+   drop to the 0.55 ice limit only within 0.4 m of the ice edge, measured along the new heading. The robot is down to
+   0.6 m/s within 0.25–0.46 m of the command dropping. The rough-corner stumbles had all been 0.56–0.86 m before the
+   edge, at 0.55. Since then: no stumble in a rough corner before ice in 40 runs; L7 seed 2 (3, 5) fell once in 6
+   runs (a snag at the same spot at 0.9; was 7 falls in 20), L9 seed 5 (6, 4) 0 in 6 (was 1 in 8).
+2. **Trench after a rough cell: the old 0.68.** L9 seed 2's trench (4, 0) comes right after the rough cell (3, 0).
+   It never fell in 32 crossings with the old pilot. With `ROUGH_SPEED` it fell in 3 of 14 (stumbles on the trench
+   line, same speed, heading and lane there). Now a rough cell whose target is a trench, or the way into a rough cell
+   whose next cell straight on is a trench, keeps 0.68 (`rough_before_trench`). **Limit:** the trench is classified
+   only about 1.6 m ahead, so the first half of (3, 0) still runs at 0.9 (0.9 → 0.68 → 0.9); the latest 8 crossings
+   still had 1 fall. Running rough cells at 0.68 until the next cell is known would restore the old approach fully.
+3. **Stuck guard sees snags:** `_stuck_guard` predicts from the measured velocity (`lin_vel_b`), not the command.
+   After the (5, 0) turn-back, a robot snagged on a box near its t = 10 s position was predicted 1 m clear and got a
+   STUCK reset at t = 20 s (2 in 12 L7 seed 2 runs). Since the fix: 0 in 6, the guard stepping it off the spot in 3.
+
+**Benchmark with all five changes (traced):**
+
+| Maze | Run 1 | Run 2 | Bar (685 s runs) |
+|---|---|---|---|
+| L7 seed 1 | 59.5 | 59.2 | 63.1 / 62.9 |
+| L7 seed 2 | 86.5 | 86.7 | 91.8 / 90.6 |
+| L7 seed 3 | 78.8 | 78.6 | 82.0 / 81.6 |
+| L7 seed 4, random ends | 45.6 | 46.6 | 49.7 / 50.5 |
+| L9 seed 1 | 115.9 | 116.0 | 123.6 / 122.1 |
+| L9 seed 2 | 86.7 | 87.1 | 93.9 / 96.2 |
+| L9 seed 3 | 85.7 | 83.6 | 94.2 / 93.2 |
+| L9 seed 5, random ends | 80.0 | 83.2 | 86.9 / 87.8 |
+| **Total** | **638.7 s, 0 falls** | **641.0 s, 0 falls** | 685 / 685 s, 0 falls |
+
+Faster in every maze, about 45 s per set, and no falls in either set. Six extra L9 seed 2 runs: 86.6–90.7 s, one fall
+at the (4, 0) trench (166.5 s). Stalls of 1 s or more: 2 in 22 runs, both lining up for a spike lane at 0.50 m/s.
+
 ## 4. Gotchas learned the hard way
 
 - **Runs vary.** The same seed can differ by 50+ s. Never judge a change from one run.
@@ -303,6 +457,12 @@ Two findings about the 685 s version's entry still apply:
 - **Upload check** rejects any file mentioning `GENERATED`, `HAZARDS`, `HARD_CELLS` or `g1_maze_lab.terrains`. Never
   copy debug code into `pilot.py`.
 - **The training terrain has no walls**, and its fall check is the torso only. The policy knows nothing about walls.
+- **Turning on the spot on rough floor moves the robot** (0.26 m on average, up to 1.0 m: a foot catches a box), far
+  more than on plain floor (0.11 m). Wall-clearing during the rotation (0.15 m/s) is too slow for that lurch. Avoid
+  rotating on loose boxes where there is a choice (`_plan_rough_exit`).
+- **Newton uses the larger friction of two touching shapes** (MuJoCo's rule) unless one has a higher `mjc:priority`.
+  Randomizing the feet's friction below the floor's 1.0 does nothing; slippery ground has to be a separate mesh with
+  priority, like the maze's ice (`HazardTerrainImporter`). `G1-Hazard-Pro`'s 0.2–1.0 foot friction never made ice.
 - **The wall latch is permanent.** No false walls appeared in 11 traced runs, but any new wall-sensing code must keep
   that true. Check the `# MAP` lines from the trace wrapper.
 - **The policy drifts to its own left** (about 8 cm per metre walking straight, more just after a turn). Normal
@@ -331,7 +491,12 @@ Two findings about the 685 s version's entry still apply:
 ## 5. Open problems and next steps (in priority order)
 
 1. **Snags on rough floor** (a foot caught on a loose box): L7 seed 2 corner (3, 5) snags in every run, about 2 s,
-   and sometimes falls. L9 seed 5 snags before its slalom. See item 7.
+   and sometimes falls. L9 seed 5 snags before its slalom. See item 7. The rough-floor test (section 3) says slower
+   is worse: 20–28% of robots snag at the pilot's 0.68 m/s, 4–8% at 0.9 m/s with no falls. `ROUGH_SPEED = 0.9` in the
+   maze (section 3, "Rough floor at 0.9 m/s in the maze"), with the follow-up fixes for rough corners into ice, the
+   trench approach and the stuck guard: 638.7 / 641.0 s, 0 falls (section 3, "Rough corners into ice, trench
+   approach, stuck guard"). **Open:** L9 seed 2's trench after a rough cell (1 fall in the latest 8 crossings, 0 in
+   32 with the old pilot), and the L7 seed 2 (3, 5) snag spot (a box on the curve's path, at any speed).
    *Fixed 2026-11-03:*
    - **Steep-ramp stalls** (0.29–0.30 m; L9 seed 2 stalled in 4 of 16 runs, about 120 s each) came from climbing at
      0.70 m/s. Steep ramps are now climbed at 0.9 m/s (section 3, "Ramp test").
@@ -358,8 +523,9 @@ Two findings about the 685 s version's entry still apply:
    entrance. Penalise both the robot's cell and the target.
 5. **Wall clearance in normal driving:** there is no body-width model. The turn-back has a 0.5 m lidar clearance check,
    but normal tracking and the unstuck reflex don't.
-6. **Slalom crossing speed:** the policy strafes at only about 0.18 m/s when commanded 0.30–0.35. Training with
-   `lin_vel_y` up to ±0.5 would make crossings faster.
+6. **Slalom crossing speed:** the policy strafes at only about 0.18 m/s when commanded 0.30–0.35 (sideways test:
+   48–66% of the command, weaker to the right). `G1-Hazard-Challenge` trains sideways commands up to 0.5 m/s with a
+   tight sideways reward (section 3, "Policy training setup").
 7. **One unexplained fall** in a level 7 seed 2 repeat: its log was overwritten. If L7 seed 2 falls again, trace it.
    **Snags on rough floor** (stall ≥ 1 s with the chest raised: a foot on a loose box): 9 in 68 traced runs, all in or
    next to rough cells. L9 seed 5 random ends snags at the same spot (about (9.65, 4.4), lining up for the slalom at

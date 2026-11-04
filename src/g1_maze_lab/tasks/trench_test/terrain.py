@@ -7,12 +7,16 @@ across the middle of the tile, and the spawn point ``start_distance`` before the
 * ramp: the maze's trapezoid hump, up ``ramp_length``, a flat top, down again (``corridor_ramp_terrain``)
 * ice: one maze cell of ice (``corridor_ice_terrain``); the tile is a separate low-friction mesh added by the hazard
   maze's terrain generator / importer, as in the challenge
+* rough floor: a corridor of maze rough cells, straight or an L (``rough_corridor_terrain``)
+* open floor: flat floor without walls, for sideways stepping (``open_floor_terrain``)
 
 The trench width / ramp height comes from the tile's row: with a curriculum generator, row ``r`` of ``len(values)``
 rows gets ``values[r]``, so every robot's hazard is known from its terrain level.
 """
 
 from __future__ import annotations
+
+import math
 
 import numpy as np
 import trimesh
@@ -170,6 +174,88 @@ class CorridorIceCornerTerrainCfg(SubTerrainBaseCfg):
     wall_thickness: float = 0.15  # [m]
     wall_height: float = 1.0  # [m]
     start_distance: float = 3.0  # Spawn point west of the corner cell's centre [m]
+
+
+def open_floor_terrain(difficulty: float, cfg: OpenFloorTerrainCfg) -> tuple[list[trimesh.Trimesh], np.ndarray]:
+    """Flat floor without walls (sideways stepping and drift test); spawn at the tile centre."""
+    sx, sy = cfg.size
+    return [_box(0.5 * sx, 0.5 * sy, -0.5, sx, sy, 1.0)], np.array([0.5 * sx, 0.5 * sy, 0.0])
+
+
+@configclass
+class OpenFloorTerrainCfg(SubTerrainBaseCfg):
+    """Flat floor without walls (see :func:`open_floor_terrain`)."""
+
+    function = open_floor_terrain
+
+
+ROUGH_KINDS = ("straight", "lineup", "left", "right")  # One row per kind of rough-floor corridor
+ROUGH_LINEUP = (2.0, 0.48)  # lineup: 2.0 m after the spawn the lane moves 0.48 m sideways (a spike-lane line-up)
+
+
+def rough_path(kind: str, cfg: RoughCorridorTerrainCfg) -> list[tuple[float, float]]:
+    """Centreline of a rough corridor as waypoints relative to the spawn point (the returned origin)."""
+    if kind in ("straight", "lineup"):
+        return [(0.0, 0.0), (cfg.size[0] - cfg.spawn_x, 0.0)]
+    leg = cfg.corner_x - cfg.spawn_x  # East leg up to the corner cell's centre
+    out = cfg.size[1] - cfg.corridor_y  # Leg after the corner, to the tile edge
+    return [(0.0, 0.0), (leg, 0.0), (leg, out if kind == "left" else -out)]
+
+
+def rough_corridor_terrain(difficulty: float, cfg: RoughCorridorTerrainCfg) -> tuple[list[trimesh.Trimesh], np.ndarray]:
+    """Walled corridor of maze rough cells (10 loose 2-8 cm boxes per 2 m cell, as hazard_maze.py), straight east or
+    an L turning left / right at (``corner_x``, ``corridor_y``); the row's ``kinds`` entry picks it (``lineup`` is
+    the straight corridor, the script moves the lane). A right turn is the left one mirrored in y. Spawn at
+    (``spawn_x``, ``corridor_y``), boxes kept ``spawn_clear`` away from it."""
+    sx, sy = cfg.size
+    kind = cfg.kinds[min(int(difficulty * len(cfg.kinds)), len(cfg.kinds) - 1)]
+    c, hw, t, h = cfg.cell_size, cfg.corridor_half_width, cfg.wall_thickness, cfg.wall_height
+    cx, cy = cfg.corner_x, cfg.corridor_y
+    boxes = [(0.5 * sx, 0.5 * sy, -0.5, sx, sy, 1.0)]  # Floor, top at z = 0: (centre x, y, z, size x, y, z)
+    if kind in ("straight", "lineup"):
+        for side in (-1.0, 1.0):
+            boxes.append((0.5 * sx, cy + side * (hw + 0.5 * t), 0.5 * h, sx, t, h))
+        cells = [((i + 0.5) * c, cy) for i in range(int(sx // c))]
+    else:  # L turning left (north) at the corner, as G1-Ice-Corner-Test
+        boxes.append((0.5 * (cx + hw + t), cy - hw - 0.5 * t, 0.5 * h, cx + hw + t, t, h))  # South wall
+        boxes.append((0.5 * (cx - hw), cy + hw + 0.5 * t, 0.5 * h, cx - hw, t, h))  # North wall up to the corner
+        y0 = cy - hw - t
+        boxes.append((cx + hw + 0.5 * t, 0.5 * (y0 + sy), 0.5 * h, t, sy - y0, h))  # East wall (outside of the turn)
+        boxes.append((cx - hw - 0.5 * t, 0.5 * (cy + hw + sy), 0.5 * h, t, sy - cy - hw, h))  # West wall after it
+        cells = [((i + 0.5) * c, cy) for i in range(int(cx // c) + 1)]
+        cells += [(cx, cy + k * c) for k in range(1, int((sy - cy) // c) + 1)]
+    rng = np.random.default_rng(int(round(difficulty * 1e6)))  # Same boxes for the same generator seed
+    inner = c - t - 0.3  # Box centres within +-inner/2 of the cell centre (hazard_maze.py)
+    for px0, py0 in cells:
+        for _ in range(cfg.boxes_per_cell):
+            bx, by = rng.uniform(0.15, 0.4, size=2)
+            bh = rng.uniform(*cfg.box_height_range)
+            px, py = px0 + rng.uniform(-0.5 * inner, 0.5 * inner), py0 + rng.uniform(-0.5 * inner, 0.5 * inner)
+            if math.hypot(px - cfg.spawn_x, py - cy) < cfg.spawn_clear:
+                continue
+            boxes.append((px, py, 0.5 * bh, bx, by, bh))
+    if kind == "right":
+        boxes = [(x, sy - y, z, a, b, d) for x, y, z, a, b, d in boxes]
+        cy = sy - cy
+    return [_box(*b) for b in boxes], np.array([cfg.spawn_x, cy, 0.0])
+
+
+@configclass
+class RoughCorridorTerrainCfg(SubTerrainBaseCfg):
+    """Walled corridor of maze rough cells (see :func:`rough_corridor_terrain`)."""
+
+    function = rough_corridor_terrain
+    kinds: tuple[str, ...] = ROUGH_KINDS  # Corridor kind per terrain row
+    spawn_x: float = 1.0  # Spawn point (middle of the first cell) [m]
+    corridor_y: float = 3.0  # Corridor centreline (before mirroring) [m]
+    corner_x: float = 5.0  # Corner cell centre [m]
+    cell_size: float = 2.0  # [m]
+    boxes_per_cell: int = 10  # hazard_maze.py rough_boxes_per_cell
+    box_height_range: tuple[float, float] = (0.02, 0.08)  # hazard_maze.py rough_height_range [m]
+    spawn_clear: float = 0.5  # No box centre this close to the spawn point [m]
+    corridor_half_width: float = 0.925  # [m]
+    wall_thickness: float = 0.15  # [m]
+    wall_height: float = 1.0  # [m]
 
 
 @configclass

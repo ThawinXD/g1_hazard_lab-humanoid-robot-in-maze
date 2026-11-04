@@ -1,5 +1,5 @@
-"""Trench / ramp / ice test environments (``scripts/trench_test.py``, ``scripts/ice_turn_test.py``): walled
-corridors with one hazard each."""
+"""Trench / ramp / ice / rough-floor / sideways test environments (``scripts/trench_test.py``, ``ice_turn_test.py``,
+``rough_test.py``, ``strafe_test.py``): walled corridors with one hazard each, or open floor."""
 
 import gymnasium as gym
 
@@ -43,6 +43,28 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.env_cfg:G1IceCornerTestEnvCfg",
+        "default_agent": "rsl_rl",
+        "rsl_rl_cfg_entry_point": "g1_maze_lab.tasks.maze.agents.rsl_rl_ppo_cfg:G1MazePPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="G1-Rough-Test",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.env_cfg:G1RoughTestEnvCfg",
+        "default_agent": "rsl_rl",
+        "rsl_rl_cfg_entry_point": "g1_maze_lab.tasks.maze.agents.rsl_rl_ppo_cfg:G1MazePPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="G1-Strafe-Test",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.env_cfg:G1StrafeTestEnvCfg",
         "default_agent": "rsl_rl",
         "rsl_rl_cfg_entry_point": "g1_maze_lab.tasks.maze.agents.rsl_rl_ppo_cfg:G1MazePPORunnerCfg",
     },

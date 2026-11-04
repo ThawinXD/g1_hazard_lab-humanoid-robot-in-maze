@@ -56,8 +56,19 @@ Turns on the spot on ice like the pilot's (`ICE_RATES`, `ICE_TURNS`, `ICE_SPEED`
 PYTHONIOENCODING=utf-8 uv run python scripts/ice_turn_test.py --task G1-Ice-Corner-Test --checkpoint <model.pt>
 ```
 
-Training: `uv run isaaclab train --rl_library rsl_rl --task G1-Hazard-Pro --num_envs 1024 --checkpoint <ckpt>`.
-Checkpoints land in `logs/rsl_rl/<experiment>/<run>/` (git-ignored).
+Rough-floor snags (corridors of maze rough cells: straight, lining up, L corners; `ROUGH_SPEEDS`, `ROUGH_TIME`,
+`ROUGH_REPEATS`) and sideways steps / straight-walking drift on open floor (`STRAFE_SPEEDS`, `STRAFE_WALK`,
+`STRAFE_TIME`, `STRAFE_SETTLE`, `STRAFE_REPEATS`):
+
+```bash
+PYTHONIOENCODING=utf-8 uv run python scripts/rough_test.py --checkpoint <model.pt>
+PYTHONIOENCODING=utf-8 uv run python scripts/strafe_test.py --checkpoint <model.pt>
+```
+
+Training: `uv run isaaclab train --rl_library rsl_rl --task G1-Hazard-Challenge --num_envs 1024 --checkpoint <ckpt>`
+(`G1-Hazard-Pro` trained `model_8497`; `G1-Hazard-Challenge` adds real ice, pilot-like commands, a sideways reward and
+harder hazards, see handoff.md §3). Checkpoints land in `logs/rsl_rl/<experiment>/<run>/` (git-ignored). Judge a new
+checkpoint with the trench / ramp / ice / rough / sideways tests against `model_8497` before the maze benchmark.
 
 ## Architecture
 
@@ -75,8 +86,13 @@ Checkpoints land in `logs/rsl_rl/<experiment>/<run>/` (git-ignored).
 - **Maze generation** `src/g1_maze_lab/terrains/` (`maze.py`, `hazard_maze.py`): procedural maze with a short
   (hard hazards) and a long (easier) route from the start fork.
 - **Training tasks** `src/g1_maze_lab/tasks/` registered via the `isaaclab.tasks` entry point: `curriculum/`
-  (Lab 7.1, incl. the `terrain_levels_skill` curriculum term in `mdp/curriculums.py`), `maze/`, and
-  `hazard_starter/` (`G1-Hazard-Starter`, `G1-Hazard-Pro`; training terrain has no walls).
+  (Lab 7.1, incl. the `terrain_levels_skill` curriculum term in `mdp/curriculums.py`), `maze/`,
+  `hazard_starter/` (`G1-Hazard-Starter`, `G1-Hazard-Pro`; training terrain has no walls) and `hazard_challenge/`
+  (`G1-Hazard-Challenge`: maze ice through the hazard importer, `PilotLikeVelocityCommand`, `track_lin_vel_y_exp`).
+  `trench_test/` holds the policy test tasks (`G1-Trench-Test`, `-Ramp-`, `-Ice-`, `-Ice-Corner-`, `-Rough-`,
+  `-Strafe-Test`).
+- **Friction:** Newton uses the larger friction of two touching shapes unless one has a higher `mjc:priority`, so
+  slippery ground must be a separate prioritized mesh (as the maze's ice); lowering the feet's friction does nothing.
 - **Tests** `tests/`: simulator-free. `test_pilot_review.py` has a regression test per pilot fix with synthetic
   scan/lidar/wall helpers; `test_challenge_upload.py` mirrors the server's upload checks.
 

@@ -61,6 +61,11 @@ STEEP_RAMP_SPEED = 0.9  # Speed limit up a steep ramp [m/s] (scripts/trench_test
 # crossed 49-59% at 0.7 (the rest stalled on the slope), 99-100% at 0.9 with no falls, 100% restarting halfway up;
 # restarting halfway up at 1.0-1.1 gave 1-2% falls)
 RAMP_RUNUP = 1.0  # ... from this far before its slope [m] (the slope starts at the cell border)
+ROUGH_SPEED = 0.9  # Speed limit on / into rough cells [m/s] (scripts/rough_test.py: 20-28% of robots snagged on a box
+# at 0.68, 4-8% at 0.9 with no falls, corners and lane line-ups included; low ramps keep 0.68)
+ICE_SLOW_DIST = 0.4  # In a rough cell before ice, keep ROUGH_SPEED until this close to the ice edge [m], then the ice
+# limit (the robot is down to 0.6 m/s within 0.25-0.46 m). At the ice limit all the way, the rough corners before ice
+# (level 7 seed 2 (3, 5), level 9 seed 5 (6, 4)) stumbled 0.56-0.86 m before the edge: 3 falls in 24 runs
 PIVOT_ENTER_ERR = 2.0  # Turn back on the spot when the heading must change by more than this [rad] (~115 deg)
 PIVOT_EXIT_ERR = 0.3  # Rotation done when the heading error is below this [rad]
 PIVOT_BRAKE_ACC = 2.0  # Deceleration while stopping before a turn-back [m/s^2]
@@ -68,6 +73,9 @@ PIVOT_BRAKE_ACC_ICE = 0.6  # Same on ice (1.0 tested 2026-11-02: the robot fell 
 PIVOT_CLEARANCE = 0.5  # Step away from walls closer than this [m] before rotating (elbows reach ~0.3 m)
 PIVOT_TURN_RATE = 1.0  # Max yaw rate while rotating on the spot [rad/s]
 PIVOT_TURN_RATE_ICE = 0.6  # Same on ice (0.9 tested 2026-11-02: 3 falls while rotating in 16 runs, 0 at 0.6)
+PIVOT_ROUGH_EXIT = 0.35  # A turn-back decided in a rough cell walks on into the open plain cell ahead and brakes from
+# this far past its border [m]: rotating on loose boxes moved the robot 0.26 m on average and over 0.3 m in 32% of 133
+# turns (0.3-1.0 m in level 7 seed 2's (4, 0), one crash into the wall), on plain floor 0.11 m (none of 84 over 0.3 m)
 STUCK_CHECK_PERIOD = 10.0  # challenge.py: < 0.25 m moved between checks every 10 s of sim time = STUCK (reset)
 STUCK_GUARD_WINDOW = 1.5  # Look ahead this long before each check [s]
 STUCK_GUARD_DIST = 0.35  # Keep at least this far from the previous check's position at check time [m]
@@ -199,6 +207,8 @@ class Pilot:
         self.pivot_yaw = torch.zeros(num_envs, dtype=torch.float32, device=device)  # Heading to rotate to [rad]
         self.pivot_t0 = torch.zeros(num_envs, dtype=torch.float32, device=device)  # Time the current phase started [s]
         self.pivot_dir = torch.zeros(num_envs, dtype=torch.float32, device=device)  # Rotation sign (+1 / -1), 0 = not chosen
+        self.pivot_exit = torch.full((num_envs,), float("nan"), device=device)  # Brake only past this line [m]
+        self.pivot_from = torch.zeros(num_envs, dtype=torch.long, device=device)  # Direction walked before turning
         # Position at challenge.py's last 10 s stuck check (it starts at the start cell centre at t = 0)
         self.check_pos = self.ap.centre_of(start_t.repeat(num_envs, 1))
         self._check_idx = 0  # Index of the last 10 s check seen
@@ -773,20 +783,35 @@ class Pilot:
             centre = (ci if travel_axis == 0 else cj) * self.cell_size  # Trench line along the travel axis
             past = (float(pos[travel_axis].item()) - centre) * travel_sign  # Pelvis past the trench line [m]
             crossing_trench = past < TRENCH_CLEAR_U
-        ramp_runup = False  # In the last RAMP_RUNUP before a steep ramp's slope (not on ice): build up climbing speed
-        if ttype == CELL_STEEP_RAMP and ctype != CELL_ICE:
-            foot = ((ti if travel_axis == 0 else tj) - 0.5 * travel_sign) * self.cell_size  # Slope foot = cell border
-            ramp_runup = (foot - float(pos[travel_axis].item())) * travel_sign < RAMP_RUNUP
+        edge = ((ti if travel_axis == 0 else tj) - 0.5 * travel_sign) * self.cell_size  # Near border of the target
+        to_edge = (edge - float(pos[travel_axis].item())) * travel_sign  # Distance left to the target cell [m]
+        rough_before_ice = ctype == CELL_ROUGH and ttype == CELL_ICE and to_edge > ICE_SLOW_DIST  # Ice still ahead
+        bi, bj = ti + di, tj + dj  # Cell straight beyond the target
+        inside = 0 <= bi < self.num_cells and 0 <= bj < self.num_cells
+        beyond = int(self.cell_type[env_id, bi, bj].item()) if inside else CELL_UNKNOWN
+        rough_before_trench = (ctype == CELL_ROUGH and ttype == CELL_TRENCH) or (
+            ttype == CELL_ROUGH and beyond == CELL_TRENCH
+        )  # On / toward a rough cell right before a trench
+        # In the last RAMP_RUNUP before a steep ramp's slope (not on ice): build up climbing speed (the slope's foot is
+        # the target's border)
+        ramp_runup = ttype == CELL_STEEP_RAMP and ctype != CELL_ICE and to_edge < RAMP_RUNUP
         if crossing_trench:
             speed = min(speed, TRENCH_SPEED)  # Cross briskly, whatever comes next: slow robots straddle and fall
         elif ctype == CELL_STEEP_RAMP or ramp_runup:
             speed = min(speed, STEEP_RAMP_SPEED)  # Fast enough not to stall on the slope
         elif ttype == CELL_STEEP_RAMP:
             speed = min(speed, 0.70)  # Before the run-up (and on ice before a ramp)
+        elif rough_before_ice:
+            speed = min(speed, ROUGH_SPEED)  # Brisk over the boxes, slowing for the ice only just before it
         elif ctype == CELL_ICE or ttype == CELL_ICE:
             speed = min(speed, 0.55)  # Reduced speed on low-friction ice tiles
-        elif ctype in (CELL_ROUGH, CELL_LOW_RAMP) or ttype in (CELL_ROUGH, CELL_LOW_RAMP):
-            speed = min(speed, 0.68)  # Balanced speed over loose boxes and low ramps
+        elif rough_before_trench:
+            speed = min(speed, 0.68)  # The old steady approach (level 9 seed 2's trench after a rough cell: 0 falls in
+            # 32 crossings; with ROUGH_SPEED there or 0.9 -> 0.68 -> 0.9 on the way, 3 in 14 stumbled on the line)
+        elif ctype == CELL_LOW_RAMP or ttype == CELL_LOW_RAMP:
+            speed = min(speed, 0.68)  # Balanced speed over low ramps
+        elif ctype == CELL_ROUGH or ttype == CELL_ROUGH:
+            speed = min(speed, ROUGH_SPEED)  # Brisk over loose boxes: slower robots catch a foot more often
         elif ttype == CELL_TRENCH:
             speed = min(speed, TRENCH_SPEED)  # Approach from plain floor (ice / rough before it keep their limit)
 
@@ -872,20 +897,24 @@ class Pilot:
         ahead = float(((self.ap.centre_of(self.ap.target[env_id]) - pos) * step).sum().item())  # To its centre [m]
         return ahead - 0.5 * self.cell_size < STUCK_BLAME_DIST  # Distance to the target's near edge
 
-    def _stuck_guard(self, env_id: int, pos: torch.Tensor, yaw: float) -> tuple | None:
+    def _stuck_guard(
+        self, env_id: int, pos: torch.Tensor, yaw: float, vel_b: torch.Tensor | None = None
+    ) -> tuple | None:
         """Avoid a false STUCK reset at challenge.py's 10 s position check, or None when not needed.
 
         challenge.py resets the robot when it moved < 0.25 m between two checks 10 s apart -- even if it walked away
         and came back (e.g. into a dead end and out again, with a stop to turn on the spot). Shortly before each
         check, predict the position at check time; if it would be within STUCK_GUARD_DIST of the last check's
         position, hold still (when already far enough) or step along the corridor axis away from that spot
-        (along the axis, so a safe lane next to a spike bed is kept).
+        (along the axis, so a safe lane next to a spike bed is kept). The prediction uses the measured velocity
+        ``vel_b`` when given: a robot snagged on a box while commanded 0.9 m/s was predicted well clear, and the
+        guard woke only 0.56 s before the check (level 7 seed 2, (4, 0): reset).
         """
         to_check = (STUCK_CHECK_PERIOD - self.sim_time % STUCK_CHECK_PERIOD) % STUCK_CHECK_PERIOD
         if to_check <= 0.0 or to_check > STUCK_GUARD_WINDOW:
             return None
         c, s = math.cos(yaw), math.sin(yaw)
-        v_b = self.ap.cmd[env_id]
+        v_b = self.ap.cmd[env_id] if vel_b is None else vel_b  # Body-frame velocity [v_x, v_y, ...]
         v_w = torch.stack((v_b[0] * c - v_b[1] * s, v_b[0] * s + v_b[1] * c))  # Commanded velocity, maze frame
         ref = self.check_pos[env_id]
         if float(torch.linalg.norm(pos + v_w * to_check - ref).item()) > STUCK_GUARD_DIST:
@@ -907,6 +936,35 @@ class Pilot:
         self.pivot_state[env_id] = 1  # Phase 1: brake
         self.pivot_t0[env_id] = self.sim_time
         self.pivot_dir[env_id] = 0.0  # Rotation direction not chosen yet
+        self.pivot_exit[env_id] = float("nan")  # Brake right away (see _plan_rough_exit)
+
+    def _plan_rough_exit(self, env_id: int, cell: torch.Tensor, from_dir: int, u_along: float, yaw: float):
+        """Turning back in a rough cell: rotate on the plain cell ahead instead, when there is one.
+
+        Turning on the spot on loose boxes catches a foot and moves the robot (up to 1.0 m in level 7 seed 2's
+        (4, 0), into the wall once). When the robot is past the rough cell's centre, still facing the way it walked,
+        and that way leads through a known opening into a plain cell, keep walking until the pelvis is
+        PIVOT_ROUGH_EXIT past the border, then brake and rotate there (the way back passes this cell anyway).
+        """
+        ci, cj = int(cell[0].item()), int(cell[1].item())
+        di, dj = DIRS[from_dir]
+        ni, nj = ci + di, cj + dj  # Cell ahead in the direction walked
+        if int(self.cell_type[env_id, ci, cj].item()) != CELL_ROUGH or u_along < 0.0:
+            return
+        if not (0 <= ni < self.num_cells and 0 <= nj < self.num_cells):  # Maze border ahead
+            return
+        if int(self.ap.walls[env_id, ci, cj, from_dir].item()) != 0:  # Only through a known opening
+            return
+        if int(self.cell_type[env_id, ni, nj].item()) != CELL_PLAIN:
+            return
+        err = math.atan2(float(dj), float(di)) - yaw
+        if abs(math.atan2(math.sin(err), math.cos(err))) > 0.5:  # Not facing the way it walked
+            return
+        axis = 0 if di != 0 else 1
+        sign = float(di if axis == 0 else dj)
+        border = (ci if axis == 0 else cj) * self.cell_size + 0.5 * self.cell_size * sign  # Edge to the plain cell
+        self.pivot_exit[env_id] = border + PIVOT_ROUGH_EXIT * sign  # Line (along the axis) to brake from
+        self.pivot_from[env_id] = from_dir
 
     def _pivot_command(self, env_id: int, yaw: float, obs: dict, cell: torch.Tensor, dt: float) -> tuple | None:
         """Velocity command while turning back on the spot, or None once the turn is done.
@@ -949,6 +1007,25 @@ class Pilot:
             self.pivot_state[env_id] = new_state
             self.pivot_t0[env_id] = self.sim_time
             self.pivot_dir[env_id] = 0.0  # Rotation direction is chosen again when rotating starts
+
+        exit_line = float(self.pivot_exit[env_id].item())
+        if state == 1 and not math.isnan(exit_line):  # Turning back in a rough cell: walk on to the plain cell first
+            hd = int(self.pivot_from[env_id].item())
+            di, dj = DIRS[hd]
+            axis, sign = (0, float(di)) if di != 0 else (1, float(dj))
+            pos = obs["pos_xy"][env_id]
+            if (float(pos[axis].item()) - exit_line) * sign < 0.0 and elapsed < 3.0:
+                head_err = math.atan2(float(dj), float(di)) - yaw  # Keep facing down the corridor
+                head_err = math.atan2(math.sin(head_err), math.cos(head_err))
+                lane = float(pos[1 - axis].item()) - (int(cell[1 - axis].item()) * self.cell_size)  # Off the centreline
+                lat_b = -lane * sign if axis == 0 else lane * sign  # Toward the centreline, body frame (+ = left)
+                v = min(max(cmd[0], 0.4), ROUGH_SPEED)  # Keep walking (the robot was at the rough-floor speed)
+                vy = max(min(0.45 * lat_b, 0.22), -0.22)
+                w = max(min(1.6 * head_err, self.ap.max_turn), -self.ap.max_turn)
+                return v, vy, w
+            self.pivot_exit[env_id] = float("nan")  # Past the line (or taking too long): brake now
+            self.pivot_t0[env_id] = self.sim_time
+            elapsed = 0.0
 
         if state == 1:  # Brake: forward / sideways / yaw commands to zero, no turning while still walking
             acc = PIVOT_BRAKE_ACC_ICE if on_ice else PIVOT_BRAKE_ACC
@@ -1097,7 +1174,11 @@ class Pilot:
             # On ice (mu = 0.2) every turn is done on the spot: walking a turn there made the robot slip and fall
             ice_turn = (cur_type[idx] == CELL_ICE) & (d != self.ap.heading[idx]) & ~self.ap.need_decision[idx]
             for k in torch.nonzero(reverse | late_turn | ice_turn).flatten().tolist():
-                self._start_pivot(int(idx[k].item()), int(d[k].item()))
+                b = int(idx[k].item())
+                self._start_pivot(b, int(d[k].item()))
+                if bool(reverse[k]):  # Turning back in a rough cell: maybe rotate on the plain cell ahead instead
+                    old = int(self.ap.heading[b].item())  # Still the direction walked so far
+                    self._plan_rough_exit(b, cell[b], old, float(u_along[b].item()), float(yaw[b].item()))
             self.ap.heading[idx] = d  # Update chosen travel direction
             dirs_f = self.ap._dirs[d].float()  # A pivot already under way rotates to the newly chosen direction
             self.pivot_yaw[idx] = torch.where(
@@ -1165,7 +1246,8 @@ class Pilot:
             yaw_b = float(yaw[b].item())
             # Just before challenge.py's 10 s stuck check: never be back where the last check saw us (not while
             # strafing across a slalom gap, where moving along the corridor would reach a spike bed)
-            guard = None if bool(self.strafe[b].item()) else self._stuck_guard(b, pos_xy[b], yaw_b)
+            vel_b = obs["lin_vel_b"][b] if "lin_vel_b" in obs else None  # Measured body velocity (snags show here)
+            guard = None if bool(self.strafe[b].item()) else self._stuck_guard(b, pos_xy[b], yaw_b, vel_b)
             if guard is not None:
                 acc = 0.6 if int(self.cell_type[b, cell[b, 0], cell[b, 1]].item()) == CELL_ICE else self.ap.max_acc
                 for k, (target_v, lim) in enumerate(zip(guard, (acc * dt, acc * dt, self.ap.max_ang_acc * dt))):
@@ -1280,6 +1362,7 @@ class Pilot:
         self.decided_tgt_type[env_ids] = CELL_UNKNOWN  # Forget the hazard type of the old target
         self.decided_cost[env_ids] = -1.0  # Forget the cost-to-goal of the old target
         self.pivot_state[env_ids] = 0  # Abort any turn-back in progress
+        self.pivot_exit[env_ids] = float("nan")  # ... and any walk to a plain cell before it
         self.check_pos[env_ids] = self.ap.centre_of(start)  # challenge.py restarts its stuck check at the start
         self.pos_anchor[env_ids] = self.ap.centre_of(start)  # Reset anti-stuck position anchor
         self.last_wp[env_ids] = self.ap.centre_of(start)  # Reset visualized waypoint to start cell center

@@ -1,4 +1,5 @@
-"""Unit tests for the trench / ramp test terrain (scripts/trench_test.py), no simulator required."""
+"""Unit tests for the hazard test terrains (scripts/trench_test.py, ice_turn_test.py, rough_test.py,
+strafe_test.py), no simulator required."""
 
 from __future__ import annotations
 
@@ -8,16 +9,22 @@ import trimesh
 from g1_maze_lab.tasks.trench_test.terrain import (
     ICE_CORNER_NEXT,
     RAMP_HEIGHTS,
+    ROUGH_KINDS,
     TRENCH_WIDTHS,
     CorridorIceCornerTerrainCfg,
     CorridorIceTerrainCfg,
     CorridorRampTerrainCfg,
     CorridorTrenchTerrainCfg,
+    OpenFloorTerrainCfg,
+    RoughCorridorTerrainCfg,
     corridor_ice_corner_terrain,
     corridor_ice_terrain,
     corridor_ramp_terrain,
     corridor_trench_terrain,
+    open_floor_terrain,
     ramp_floor_height,
+    rough_corridor_terrain,
+    rough_path,
     trench_width,
 )
 
@@ -127,3 +134,67 @@ def test_ice_corner_is_an_l_turning_left_at_an_ice_cell():
             assert not _PENDING_SPIKES, f"{kind}: unexpected spike cones"
     _PENDING_ICE.clear()
     _PENDING_SPIKES.clear()
+
+
+def _rough(kind):
+    cfg = RoughCorridorTerrainCfg(size=(8.0, 8.0))
+    rows = len(ROUGH_KINDS)
+    meshes, origin = rough_corridor_terrain((ROUGH_KINDS.index(kind) + 0.5) / rows, cfg)
+    return cfg, meshes, origin
+
+
+def test_rough_corridor_lanes_are_free_and_walled():
+    """Every kind's lane (rough_path) runs between 1.0 m walls through 2-8 cm boxes: away from the corner the walls
+    stand 0.93 m to both sides of the lane, the floor along it is at most a box high, and the spawn point is clear."""
+    for kind in ROUGH_KINDS:
+        cfg, meshes, origin = _rough(kind)
+        path = np.array(rough_path(kind, cfg)) + origin[:2]
+        assert np.allclose(path[0], origin[:2]), f"{kind}: lane does not start at the spawn point"
+        corners = path[1:-1]
+        for a, b in zip(path[:-1], path[1:], strict=True):
+            length = np.linalg.norm(b - a)
+            d = (b - a) / length
+            normal = np.array([-d[1], d[0]])
+            for t in np.arange(0.3, length - 0.2, 0.5):
+                p = a + t * d
+                if any(np.linalg.norm(p - c) < 1.0 for c in corners):  # The corner cell is open on one side
+                    continue
+                z = _top_z(meshes, [p, p + 0.93 * normal, p - 0.93 * normal, p + 0.6 * normal])
+                assert z[0] <= 0.08 + 1e-6 and z[3] <= 0.08 + 1e-6, f"{kind}: lane blocked at {p}: {z}"
+                assert np.allclose(z[1:3], 1.0, atol=1e-6), f"{kind}: walls {z[1:3]} beside {p}"
+        assert _top_z(meshes, [origin[:2]])[0] == 0.0, f"{kind}: box under the spawn point"
+
+
+def test_rough_corridor_kinds_and_boxes():
+    """Straight / lineup are the same straight corridor, right's walls are left's mirrored in y; every cell holds the
+    maze's loose boxes (at most 10 per 2 m cell, 2-8 cm high)."""
+    cfg, straight, o_s = _rough("straight")
+    _, lineup, o_l = _rough("lineup")
+    _, left, o_left = _rough("left")
+    _, right, o_right = _rough("right")
+    assert np.allclose(o_s, [cfg.spawn_x, cfg.corridor_y, 0.0]) and np.allclose(o_s, o_l)
+    assert np.allclose(o_right, [cfg.spawn_x, 8.0 - cfg.corridor_y, 0.0]) and np.allclose(o_left, o_s)
+    assert rough_path("left", cfg)[-1] == (4.0, 5.0) and rough_path("right", cfg)[-1] == (4.0, -5.0)
+    walls = [
+        [m.bounds for m in meshes if np.isclose(m.bounds[1][2], 1.0)] for meshes in (straight, lineup, left, right)
+    ]
+    assert len(walls[0]) == 2 and np.allclose(walls[0], walls[1]) and len(walls[2]) == 4
+    mirrored = sorted(
+        (round(lo[0], 6), round(8.0 - hi[1], 6), round(hi[0], 6), round(8.0 - lo[1], 6)) for lo, hi in walls[2]
+    )
+    assert mirrored == sorted(
+        (round(lo[0], 6), round(lo[1], 6), round(hi[0], 6), round(hi[1], 6)) for lo, hi in walls[3]
+    )
+    for meshes, n_cells in ((straight, 4), (left, 5)):
+        boxes = [m for m in meshes if m.bounds[1][2] < 0.5 and m.bounds[0][2] >= -1e-9]
+        heights = np.array([m.bounds[1][2] for m in boxes])
+        assert 8 * n_cells <= len(boxes) <= 10 * n_cells, f"{len(boxes)} boxes in {n_cells} cells"
+        assert heights.min() >= 0.02 - 1e-9 and heights.max() <= 0.08 + 1e-9, (
+            f"box heights {heights.min()}-{heights.max()}"
+        )
+
+
+def test_open_floor_is_flat_without_walls():
+    meshes, origin = open_floor_terrain(0.0, OpenFloorTerrainCfg(size=(8.0, 8.0)))
+    z = _top_z(meshes, [(x, y) for x in (0.2, 4.0, 7.8) for y in (0.2, 4.0, 7.8)])
+    assert np.allclose(z, 0.0) and np.allclose(origin, [4.0, 4.0, 0.0])

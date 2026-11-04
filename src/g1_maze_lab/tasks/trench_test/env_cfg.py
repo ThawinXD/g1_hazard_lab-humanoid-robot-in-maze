@@ -1,7 +1,8 @@
 """Hazard test tasks: many G1 robots, each in a walled corridor (maze dimensions) with one hazard.
 
-``G1-Trench-Test`` (a trench), ``G1-Ramp-Test`` (the maze's ramp), ``G1-Ice-Test`` (one cell of ice) and
-``G1-Ice-Corner-Test`` (an L-shaped corridor turning at an ice cell). Same base config, observations and crash rule as
+``G1-Trench-Test`` (a trench), ``G1-Ramp-Test`` (the maze's ramp), ``G1-Ice-Test`` (one cell of ice),
+``G1-Ice-Corner-Test`` (an L-shaped corridor turning at an ice cell), ``G1-Rough-Test`` (corridors of rough cells)
+and ``G1-Strafe-Test`` (open floor without walls). Same base config, observations and crash rule as
 the challenge's maze tasks (``tasks/maze/env_cfg.py``): a G1 Rough policy, commands written directly, and torso /
 pelvis / elbows / palms touching anything (floor or wall) ends the episode. ``scripts/trench_test.py`` and
 ``scripts/ice_turn_test.py`` place the robots and drive them.
@@ -20,11 +21,14 @@ from ..maze import mdp as maze_mdp
 from .terrain import (
     ICE_CORNER_NEXT,
     RAMP_HEIGHTS,
+    ROUGH_KINDS,
     TRENCH_WIDTHS,
     CorridorIceCornerTerrainCfg,
     CorridorIceTerrainCfg,
     CorridorRampTerrainCfg,
     CorridorTrenchTerrainCfg,
+    OpenFloorTerrainCfg,
+    RoughCorridorTerrainCfg,
 )
 
 TILE_SIZE = (8.0, 3.0)  # Corridor tile: 8 m long (trench in the middle), 3 m wide (walls at +-1.0 m)
@@ -98,6 +102,33 @@ class G1RampTestEnvCfg(G1TrenchTestEnvCfg):
         gen = self.scene.terrain.terrain_generator
         gen.num_rows = len(RAMP_HEIGHTS)
         gen.sub_terrains = {"corridor_ramp": CorridorRampTerrainCfg(proportion=1.0, heights=RAMP_HEIGHTS)}
+
+
+@configclass
+class G1StrafeTestEnvCfg(G1TrenchTestEnvCfg):
+    """Open flat floor without walls, for sideways stepping and straight-walking drift (``scripts/strafe_test.py``)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        gen = self.scene.terrain.terrain_generator
+        gen.size = (8.0, 8.0)
+        gen.num_rows = 1
+        gen.num_cols = 10
+        gen.sub_terrains = {"open_floor": OpenFloorTerrainCfg(proportion=1.0)}
+
+
+@configclass
+class G1RoughTestEnvCfg(G1TrenchTestEnvCfg):
+    """Walled corridors of maze rough cells; rows = corridor kinds (``ROUGH_KINDS``) (``scripts/rough_test.py``)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        gen = self.scene.terrain.terrain_generator
+        gen.size = (8.0, 8.0)
+        gen.num_rows = len(ROUGH_KINDS)
+        gen.num_cols = 25
+        gen.seed = 1  # Same boxes in every run, so checkpoints are compared on the same floor
+        gen.sub_terrains = {"rough_corridor": RoughCorridorTerrainCfg(proportion=1.0)}
 
 
 @configclass
