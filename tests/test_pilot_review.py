@@ -517,6 +517,19 @@ def test_no_new_target_inside_goal_cell(monkeypatch):
     assert int(p.pivot_state[0]) == 0, "turning back inside the goal cell"
 
 
+def test_robot_outside_origin_and_target_redecides(monkeypatch):
+    """Level 9 seed 50: a late turn north in (3, 0) braked from 1 m/s into (4, 0); from there the pilot aimed at the
+    turn's target (3, 1), diagonally across the end of the wall between (3, 1) and (4, 1), and crashed. A robot in
+    neither its decision cell nor its target must re-decide from where it is: the new target is a neighbour."""
+    p = _pilot(monkeypatch)
+    _close_wall(p, 2, 1, 2)  # (2, 1) | (1, 1): the diagonal is blocked by a wall, as in the maze
+    _set_plan(p, origin=(1, 0), target=(1, 1), heading=1)
+    p.act(_obs((4.25, 0.2), lambda xy: torch.zeros(len(xy)), t=1.0))  # Slid into (2, 0)
+    ti, tj = (int(v) for v in p.ap.target[0])
+    assert abs(ti - 2) + abs(tj) == 1, f"target ({ti}, {tj}) is not next to the robot's cell (2, 0)"
+    assert tuple(p.ap.origin[0].tolist()) == (2, 0), "decision not made from the robot's cell"
+
+
 def test_late_replan_turn_rotates_on_the_spot(monkeypatch):
     """Past the centre of (2, 0), walking east, the target (3, 0) turns out to be a dead end and the only way on
     is north: too late for a curve, so the 90 deg turn is done by stopping and rotating on the spot."""

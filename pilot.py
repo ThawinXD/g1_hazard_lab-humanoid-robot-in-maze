@@ -1139,6 +1139,12 @@ class Pilot:
         # centre, so it keeps walking there instead of picking a next cell (and turning back out of the goal)
         at_goal = (cell == goal_t).all(dim=1)
         arrived = near_centre & (cell == self.ap.target).all(dim=1) & ~at_goal
+        # Left both the decision cell and the target (braked into the next cell for a late turn, slipped): the target
+        # is no longer next to the robot, and steering for it cut diagonally past a wall's end (level 9 seed 50: a
+        # late turn north in (3, 0) at 1 m/s slid into (4, 0), then aimed back at (3, 1) and crashed). Re-decide from
+        # the cell the robot is in; a turn on the spot under way then rotates to the new direction
+        lost = ~(cell == self.ap.origin).all(dim=1) & ~(cell == self.ap.target).all(dim=1) & ~at_goal
+        self.ap.need_decision |= lost
 
         # Re-evaluate direction if a newly sensed wall blocks our heading OR a hard hazard is spotted ahead
         still_there = (cell == self.ap.origin).all(dim=1) & ~self.ap.need_decision

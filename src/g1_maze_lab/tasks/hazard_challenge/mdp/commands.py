@@ -33,7 +33,7 @@ def _sign(n: int, device) -> torch.Tensor:
 def sample_targets(kinds: torch.Tensor, cfg: PilotLikeVelocityCommandCfg) -> torch.Tensor:
     """Command targets ``(n, 3)`` = ``[v_x, v_y, w_z]`` for robots with the given kinds (indices into ``KINDS``)."""
     n, dev, r = len(kinds), kinds.device, cfg.ranges
-    vx_max = max(float(r.lin_vel_x[1]), cfg.fast_min)  # The forward-speed curriculum widens lin_vel_x[1]
+    vx_max = max(float(r.lin_vel_x[1]), cfg.fast_max, cfg.fast_min)  # The forward-speed curriculum may widen it more
     small_vy = _uniform(-cfg.small_vy, cfg.small_vy, n, dev)  # The pilot's lane-keeping corrections
     straight_wz = _uniform(-cfg.straight_wz, cfg.straight_wz, n, dev)
     per_kind = {
@@ -105,8 +105,9 @@ class PilotLikeVelocityCommand(UniformVelocityCommand):
 
 @configclass
 class PilotLikeVelocityCommandCfg(UniformVelocityCommandCfg):
-    """Pilot-like velocity commands (:class:`PilotLikeVelocityCommand`). ``ranges`` is used by the ``random`` kind and
-    ``ranges.lin_vel_x[1]`` caps the ``fast`` kind (the forward-speed curriculum widens it)."""
+    """Pilot-like velocity commands (:class:`PilotLikeVelocityCommand`). ``ranges`` is used by the ``random`` kind;
+    the ``fast`` kind goes up to ``fast_max`` or ``ranges.lin_vel_x[1]`` (the forward-speed curriculum), whichever is
+    higher."""
 
     class_type: type = PilotLikeVelocityCommand
     heading_command: bool = False
@@ -118,7 +119,9 @@ class PilotLikeVelocityCommandCfg(UniformVelocityCommandCfg):
     """Rate limits for ``v_x``, ``v_y`` [m/s^2] and ``w_z`` [rad/s^2] (pilot.py ``ap.max_acc`` / ``ap.max_ang_acc``)."""
 
     slow_speed: tuple[float, float] = (0.15, 0.75)  # slow / slow_turn forward speed [m/s] (hazard speed limits)
-    fast_min: float = 0.75  # fast: forward speed from here to ranges.lin_vel_x[1] [m/s]
+    fast_min: float = 0.75  # fast: forward speed from here ...
+    fast_max: float = 1.1  # ... to at least here [m/s] (pilot.py cruises at 1.0; with ice falls the forward-speed
+    # curriculum stayed at 0.85 for 500 iterations, its tracking average 0.76 just under its 0.78 threshold)
     small_vy: float = 0.10  # Walking kinds: lane-keeping v_y within +-this [m/s]
     straight_wz: float = 0.3  # slow: |w_z| below this [rad/s]
     turn_wz: tuple[float, float] = (0.3, 1.1)  # slow_turn: |w_z| [rad/s] (pilot.py max_turn 1.1)

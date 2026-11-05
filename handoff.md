@@ -3,15 +3,15 @@
 Use this file to pick the work up in a new session. The full write-up of methods and results is in
 [develop.md](develop.md); this file covers the current state, how to work, and what's next.
 
-## 1. Where things stand (2026-11-03)
+## 1. Where things stand (2026-11-05)
 
 | Part | State |
 |---|---|
 | Walking policy | `logs/rsl_rl/g1_hazard_pro/2026-10-31_17-46-45_skill_curr1500/model_8497.pt`. Trained with the fixed terrain curriculum (`terrain_levels_skill`). Climbs ramps up to about 0.28 m and crosses trenches. **`logs/` is git-ignored, so this file exists only on this machine. Back it up**, for example by copying it to `pretrained/`. |
 | Pilot | [pilot.py](pilot.py), 1,348 lines. Includes the dead-end fix, lidar wall mapping, turn-back on the spot, stuck-check guard and the fixes found in testing (develop.md §4.8), plus (2026-11-02) trench crossing at 0.9 m/s and the stall-blame rule (section 5, item 7), and (2026-11-03) steep ramps climbed at 0.9 m/s after a 1 m run-up (section 3, "Ramp test") and ice turns decided at the ice edge (section 3, "Ice turn test"). The 2026-11-03 spike-entry and rough-floor turn experiments were reverted (section 3, "Spike-lane corners"; section 4). |
-| Training setup | `G1-Hazard-Challenge` (real ice, pilot-like commands, sideways reward, harder hazards) plus the sideways and rough-floor tests, built 2026-11-03 and **not trained yet** (section 3, "Policy training setup"). Challenge day: Saturday 2026-11-14. |
-| Pilot changes (2026-11-04) | In the working tree, **not committed**: rough-floor speed 0.9 (`ROUGH_SPEED`), turn-backs moved off rough floor (`PIVOT_ROUGH_EXIT`), rough corners into ice at rough speed (`ICE_SLOW_DIST`), the old 0.68 before trenches, and the stuck guard using measured velocity. Benchmark **638.7 s and 641.0 s, 0 falls** (bar 685 / 685); residual risk at L9 seed 2's trench (section 3, "Rough corners into ice, trench approach, stuck guard"). |
-| Tests | `uv run pytest tests`: **103 pass** (no simulator needed). |
+| Training setup | `G1-Hazard-Challenge` (real ice, pilot-like commands, sideways reward, harder hazards) plus the sideways and rough-floor tests, built 2026-11-03. **Tried 2026-11-04/05 and dropped: `model_8497` stays the policy.** Two runs (from `model_5600`, 3,000 iterations; from `model_8497`, 1,500) gave checkpoints much better on trenches and ramps, but each had a new weakness: long ice turns (late checkpoints), weak sideways steps (`model_7500`: 1152.5 s, 6 resets on the benchmark) or forward drift at slow / backward commands (`model_9500`: 1012.4 / 901.8 s, 5 / 3 resets, every level 9 slalom hit; otherwise 4–5% faster). See section 3, "Policy training setup". Challenge day: Saturday 2026-11-14. |
+| Pilot changes (2026-11-04) | In the working tree, **not committed**: rough-floor speed 0.9 (`ROUGH_SPEED`), turn-backs moved off rough floor (`PIVOT_ROUGH_EXIT`), rough corners into ice at rough speed (`ICE_SLOW_DIST`), the old 0.68 before trenches, and the stuck guard using measured velocity. Benchmark **638.7 s and 641.0 s, 0 falls** (bar 685 / 685); residual risk at L9 seed 2's trench (section 3, "Rough corners into ice, trench approach, stuck guard"). Plus (2026-11-05) the re-decide when a late turn ends in the next cell (`lost`, L9 seed 50): seed 50 crash gone in 3 of 3 runs, benchmark 645.8 s / 0 falls and 728.4 s / 1 trench fall not caused by it (section 3, "Late turn that ends in the next cell"). |
+| Tests | `uv run pytest tests`: **104 pass** (no simulator needed). |
 | Git | Branch `side-test`. Everything through the 2026-11-03 ramp and ice-turn work is committed (`git log` for the latest commit; `tools/` and `logs/` are git-ignored, so the checkpoint is not in git). The training setup is not committed yet. Ask before committing. |
 | Submission | Upload `model_8497.pt` as `policy.pt` plus `pilot.py`. `PILOT_MODE` already defaults to `short` (the runner sets no env vars). |
 
@@ -293,7 +293,7 @@ Two findings about the 685 s version's entry still apply:
 - **A reset just before a 10 s STUCK check counts twice.** The check compares with the position 10 s earlier, which may
   be the same start (L7 seed 4: an ice fall at 9.8 s, then a STUCK at 10.0 s).
 
-### Policy training setup (2026-11-03, built, not trained yet)
+### Policy training setup (2026-11-03; trained 2026-11-04/05, dropped: `model_8497` stays)
 
 **The policy never trained on ice.** `G1-Hazard-Pro` randomizes foot friction 0.2–1.0 to cover ice, but Newton's
 MuJoCo solver uses the *larger* friction of two touching shapes (the reason the maze's ice needs `mjc:priority`), and
@@ -311,7 +311,8 @@ at 1 rad/s); on the maze's ice the feet slip at 0.42–0.64 m/s.
    turning), 5% turning on the spot (33% of the time on ice), 3% sideways (37% of slalom time). The new term picks a
    kind per robot: slow 30%, slow turning 20%, fast 15%, rotate on the spot 10%, sideways 10% (0.25–0.5 m/s), stand
    5%, fully random 10%; holds it 2–6 s (was 10 s) and ramps the command with the pilot's acceleration limits
-   (2 m/s², 2.8 rad/s²) from zero at every episode start.
+   (2 m/s², 2.8 rad/s²) from zero at every episode start. The fast kind runs 0.75–1.1 m/s whatever the forward-speed
+   curriculum says (further once that curriculum passes 1.1); only the random kind follows the curriculum.
 3. **Sideways speed reward** `track_lin_vel_y_exp` (std 0.2, weight 0.5). `track_lin_vel_xy_exp` (std 0.5) is
    unchanged because `terrain_levels_skill` promotes by it.
 4. **Harder hazards:** trenches 0.10–0.26 m (was 0.06–0.24), ramps 0.12–0.32 m (was 0.08–0.30). At the curriculum's
@@ -321,17 +322,119 @@ Smoke run of the training config with `model_8497` acting (256 robots, 45 s, no 
 robot time on ice (the maze: about 10%), foot slip 0.53 m/s on ice vs 0.095 off it, command kinds at their weights,
 all four curricula logging. `model_8497` fell 38 times on ice and 16 times elsewhere, with ten times less time on ice.
 
-Planned runs (each about 25 min per 1,500 iterations here):
+Runs (1.2–1.35 s per iteration here, so about 30 min per 1,500 iterations; console log in `logs/train_<run>.log`):
 
 ```bash
+uv run isaaclab train --rl_library rsl_rl --task G1-Hazard-Challenge --num_envs 1024 --checkpoint pretrained/hazard_starter/model_5600.pt agent.max_iterations=3000 agent.run_name=from5600_fast11
 uv run isaaclab train --rl_library rsl_rl --task G1-Hazard-Challenge --num_envs 1024 --checkpoint logs/rsl_rl/g1_hazard_pro/2026-10-31_17-46-45_skill_curr1500/model_8497.pt agent.max_iterations=1500 agent.run_name=from8497
-uv run isaaclab train --rl_library rsl_rl --task G1-Hazard-Challenge --num_envs 1024 --checkpoint pretrained/hazard_starter/model_5600.pt agent.max_iterations=3000 agent.run_name=from5600
 ```
 
 Watch `Curriculum/terrain_levels` in TensorBoard: ice and harder commands lower the tracking reward that promotion
 needs (75%). If the average row is still below about 5 after 500 iterations, lower the ice share or the threshold.
 A new checkpoint replaces `model_8497` only if it is at least as good on the trench, ramp and ice tests and the
 benchmark has no new falls and is not slower. Expect to retune some pilot limits for it.
+
+**First run from `model_5600` (2026-11-04, stopped at iteration 6350, folder `..._from5600`):** the terrain
+curriculum climbed faster than in the `model_8497` run (average row 5.4 after 500 iterations against 4.8), and falls
+settled at about 8% of episodes (the `model_8497` run: 5–7%). But the forward-speed curriculum never moved off
+0.85 m/s: it needs the tracking reward averaged over *all* ended episodes at 78% of its maximum, and ice falls held
+it at about 76%. The fast kind was capped by it, so the run never trained at the pilot's 1.0 m/s cruise. Fixed by
+giving the fast kind its own 1.1 m/s ceiling (`fast_max`); restarted as `from5600_fast11`. Pushes also stay off
+(they start only below a 5% fall rate); the challenge never pushes, so that was left alone.
+
+**`from5600_fast11` finished (`model_8599`, 79 min).** End of run against the end of the `model_8497` run: average
+terrain row 6.42 vs 6.43, falls 7.2% vs 5.0% of episodes, forward-speed curriculum 1.25 vs 1.35 m/s (it started
+moving at iteration 7500), pushes 0.1 vs 0.8 m/s, action noise 1.31 vs 1.19 (rose all run; the `model_8497` run's
+rose 1.15 to 1.19). Falls include the ice, which the `model_8497` run never had.
+
+**Policy tests, `model_8599` vs `model_8497` (2026-11-04, default settings, same session; logs in
+`logs/policy_tests/<m8497|m8599>/<test>.log`). It does not pass the gate (ice, tallest ramps):**
+
+| Test | `model_8497` | `model_8599` |
+|---|---|---|
+| Trench 0.22 / 0.24 m at 0.9 m/s, crossed | 83–87% / 67–76% (fell 13–33%) | **99–100% / 98%** (fell 0–2%) |
+| Trench 0.24 m at 0.7 m/s, crossed | 58–64% (fell 35–42%) | **94–97%** (fell 3–6%) |
+| Ramp 0.29 / 0.30 m at 0.9 m/s, climbed | 100% / 100% | 99% / **81–84%** (stuck, no falls) |
+| Ramp 0.30 m at 0.5 m/s, climbed | 10–13% | 28–29% |
+| Ice, straight: 180° at 0.6 rad/s, fell | 0.6% | **19.6%** (falls while rotating) |
+| Ice, straight: 180° at 0.45 / 90° at 0.3 rad/s, fell | 1.6% / 14.2% | **19.8% / 40.8%** (90°: mostly while standing after) |
+| Ice corner (90°, walk out): done | 100% (2.79 s at 0.6 rad/s) | 100% (2.35 s, spins less) |
+| Rough at 0.9 m/s: finished / robots snagged | 99.2–100% / 3.6–8.0% | 99.6–100% / 0.8–4.0% |
+| Rough at 0.68 m/s: robots snagged | 22–30% | 9–15% |
+| Sideways 0.2–0.5 m/s, reached | 48–66% | 50–62% (the sideways reward did not help) |
+| Straight 0.5 / 1.0 m/s, reached | 89% / 88% | 101% / 89%, less heading drift |
+
+So training on the hazards fixed trenches and helped rough floor, but the robot now falls when it *stays* on ice
+(long rotations, standing), the case the pilot uses for turn-backs (about a third of its turning-on-the-spot time is on
+ice), and stalls on the tallest steep ramps at the pilot's 0.9 m/s.
+
+**Earlier checkpoints of the same run (2026-11-05, ice / ramp / trench tests; logs in `logs/policy_tests/m<iter>/`).
+`model_7500` passes all three and beats `model_8497` on each:**
+
+| Test | `model_8497` | 7000 | **7500** | 8000 | 8599 |
+|---|---|---|---|---|---|
+| Ice 180° at 0.6 / 0.45 rad/s, fell | 0.6% / 1.6% | 0% / 0.4% | **0% / 0%** | 2.2% / 11.2% | 19.6% / 19.8% |
+| Ice 180° at 0.3 rad/s, fell (pilot doesn't turn this slowly on ice) | 11.4% | 21.6% | 16.6% | 49.8% | 85.2% |
+| Ramp 0.30 m at 0.9 / 0.7 / 0.5 m/s, climbed | 100 / 51–56 / 10–13% | 100 / 99 / 56–57% | **100 / 100 / 100%** | 100 / 100 / 100% | 81–84 / 36–44 / 28–29% |
+| Trench 0.24 m at 0.9 m/s, crossed | 67–76% | 90–94% | **98–100%** | 100% | 98% |
+| Trench 0.24 m at 0.5 m/s, fell | 17–26% | 16–19% | **1–3%** | 3–7% | 4% |
+
+The ice skill went bad between 7500 and 8000, when the forward-speed curriculum started widening (0.9 → 1.05 m/s by
+7750) and pushes came in; the ramp skill went after 8000. Ice corner, rough floor and sideways tests on `model_7500`
+and the maze benchmark are still to do. `logs/` is git-ignored: copy `model_7500.pt` to `pretrained/` if it is kept.
+
+**`model_7500`, rest of the gate (2026-11-05).** Ice corner 100% (2.19 s at 0.6 rad/s, fastest yet), rough floor
+better than `model_8497` (0.9 m/s: 1.2–3.6% of robots snagged; 0.68 m/s: 9.6–15.6%), but **sideways steps reach only
+27–32% of the command** (`model_8497`: 48–66%) and it keeps creeping forward. **Maze benchmark (baseline pilot
+snapshot `trench2`, i.e. without the seed-50 `lost` fix): L7 s1 59.9, s2 90.6, s3 80.2, s4 46.1, L9 s1 115.9, then
+L9 s2 380.2 s with 3 resets**, all from the weak sideways steps:
+1. t = 71.9 s, slalom (6, 7): strafe commanded v_y −0.35, v_x 0.06–0.12; measured v_y −0.01 to −0.14 and v_x +0.25,
+   so it walked forward into the spike bed (`model_8497` at the same spot: v_x 0.12–0.21 and slowing, stopped short).
+2. t = 180 s, (3, 7): strafe v_y +0.35 measured 0.02–0.07; strafe / unstuck loop until the 10 s stuck rule.
+3. t = 236.1 s, spike lane (7, 4): staging strafe at about 40% of the command, then a spike hit.
+
+Then L9 s3 183.3 s (spike lane (6, 1) at 29.1 s, plus the stuck rule firing 0.9 s after that reset) and L9 s5
+196.3 s (spike lane (5, 3) at 27.9 s). **Set 1: 1152.5 s, 6 resets (bar 638.7 s, 0)**: five are spike / sideways-step
+failures, one is the stuck-rule echo.
+
+Sideways skill varies along the run (7500: 27–32%, 8599: 50–62%) while the ice skill goes the other way, so no
+checkpoint of `from5600_fast11` has both. Any new checkpoint needs the sideways test in its gate.
+
+**Fine-tune from `model_8497` (2026-11-05, run `logs/rsl_rl/g1_hazard_challenge/2026-11-05_13-27-46_from8497`,
+1,500 iterations, 45 min).** Terrain row 6.7 after 500 iterations, forward-speed curriculum at 1.35 m/s by iteration
+8800, pushes never started (falls 7–11%). Gate tests (logs in `logs/policy_tests/f<iter>/`):
+
+| Test | `model_8497` | 7500 (from 5600) | f9000 | **f9500** | f9996 |
+|---|---|---|---|---|---|
+| Sideways reached, left / right | 63 / 51% | 32 / 29% | 55 / 54% | **62 / 60%** | 70 / 66% |
+| Sideways forward creep | 0.065 m/s | 0.077 | 0.135 | 0.135 | 0.132 |
+| Ice 90° at 0.3–0.6 rad/s, fell | 0–14% | 0% | 0% | 0–0.4% | 0–0.6% |
+| Ice 180° at 0.6 / 0.45 rad/s, fell | 0.6 / 1.6% | 0 / 0% | 9.4 / 25.8% | **7.4 / 11.4%** | 70.8 / 97.4% |
+| Ramp 0.30 m at 0.9 / 0.7 / 0.5, climbed | 100 / 54 / 12% | 100 / 100 / 100% | 100 / 100 / 100% | 100 / 100 / 100% | 100 / 100 / 100% |
+| Trench 0.24 m at 0.9 / 0.7, crossed | 72 / 61% | 99 / 100% | 100 / 96% | 98 / 100% | 99 / 99% |
+| Trench 0.24 m at 0.5, crossed / fell | 72 / 22% | 70 / 2% | 84 / 15% | 91 / 8% | 94 / 6% |
+
+Long (180°) turns on the spot on ice get worse in every fine-tuned checkpoint of both runs except the early
+from-5600 ones; 90° ice turns are fine everywhere. **In the 16 baseline benchmark runs the pilot turned on the spot on
+ice 18 times, all about 90° or less; its 180° turn-backs were all on rough (4) or plain floor.** So `model_9500` (best
+sideways / ice-180 balance, much better ramps and trenches) is the candidate for the maze benchmark; its doubled
+forward creep while stepping sideways is the thing to watch in the slaloms.
+
+**`model_9500` maze benchmark, set 1 (2026-11-05, baseline pilot snapshot): 1012.4 s, 5 resets.** Ice corner test
+first: 100% everywhere (2.75–2.78 s at 0.6 rad/s). Clean mazes are faster than `model_8497`: L7 s1 57.1, s2 86.0, s3
+75.9, s4 42.5, L9 s1 110.5 (271.0 → 261.5 s on L7, 115.9 → 110.5 s on L9 s1). But L9 s2 216.1 s (1 reset), L9 s3
+238.3 s (3), L9 s5 186.0 s (1), all from **forward drift at slow and backward commands**:
+- four slalom spike hits ((6, 7) in s2, (6, 1) twice in s3, (5, 3) in s5): commanded 0.28 m/s into the slalom, it
+  walks 0.34–0.44 m/s, then while stepping sideways (commanded v_x 0.12 down to −0.09) it still goes forward at
+  0.37 → 0.12–0.24 m/s and reaches the spike bed (`model_8497`: about 0.24 m/s in, 0.20 → 0.12 m/s while stepping);
+- one wall crash in (3, 5) of s3: backing off a wall before a turn on the spot (commanded v_x −0.13 m/s), it crept
+  *forward* at 0.02–0.11 m/s for 2.5 s until it touched the wall.
+Set 2: **901.8 s, 3 resets** (L7 s1 56.5, s2 82.4, s3 76.1, s4 43.0, L9 s1 111.0, s2 203.5, s3 144.7, s5 184.6), the
+three resets again the slalom spike hits at (6, 7), (6, 1) and (5, 3): every level 9 slalom failed in both sets. On
+the mazes without a reset it is 4–5% faster than `model_8497` (L7: 258.0 vs 271.0 s; L9 s1: 111.0 vs 116.0 s).
+Likely cause: the pilot-like commands rarely ask for backward walking (about 4% of the time against about 16% with
+`G1-Hazard-Pro`'s uniform commands), and `track_lin_vel_xy_exp` (std 0.5) barely penalizes a 0.1 m/s error. Any new
+checkpoint needs a slow / backward walking test in its gate (e.g. `STRAFE_WALK="0.28,-0.13"` with the strafe test).
 
 **Sideways test** ([scripts/strafe_test.py](scripts/strafe_test.py), task `G1-Strafe-Test`: open flat floor, 500
 robots, commands ramped in like the pilot's). `model_8497` (125 robots per row, 0 falls):
@@ -441,6 +544,41 @@ changes on top of the two above, each benchmarked:
 Faster in every maze, about 45 s per set, and no falls in either set. Six extra L9 seed 2 runs: 86.6–90.7 s, one fall
 at the (4, 0) trench (166.5 s). Stalls of 1 s or more: 2 in 22 runs, both lining up for a spike lane at 0.50 m/s.
 
+### Late turn that ends in the next cell (L9 seed 50, 2026-11-05, in the working tree)
+
+**Problem.** L9 seed 50 (start (0, 0), goal (8, 8)): walking east at 1 m/s toward (4, 0), a route re-plan at x = 6.64
+(0.64 m past the centre of (3, 0)) chose north (3, 1). That is a late turn, so the pilot brakes and turns on the spot;
+the brake from 1 m/s carried the robot 0.6 m on, into (4, 0). It rotated there and then followed the corner curve laid
+out from (3, 0), which aimed diagonally past the end of the wall between (3, 1) and (4, 1): lidar 0.27 m and a crash in
+one run, 0.19 m in the other (the same pattern as L7 seed 2's (5, 0) turn-back).
+
+**Fix (`act()`, after `arrived`):** a robot in neither its decision cell nor its target (and not in the goal cell)
+re-decides from the cell it is in (`lost`); a turn on the spot under way rotates to the new direction. Test:
+`test_robot_outside_origin_and_target_redecides`.
+
+**Result (traced, `model_8497`).** L9 seed 50, 3 runs: 161.1 / 160.8 / 160.4 s, 0 falls. Each time the rule fired at
+12.3 s in (4, 0), sent the robot back west into (3, 0) and round the corner from there; lowest lidar in (3, 0) / (4, 0)
+0.42–0.73 m (was 0.19–0.27 m). All three runs took the long route (the route-choice problem, section 5 item 2; the
+short route took about 89 s in the earlier run that crashed). In the 16 benchmark runs the rule fired only at L7 seed 2's
+(5, 0) turn-back, where `PIVOT_ROUGH_EXIT` walks into (5, 0) on purpose: it re-decided (4, 0), the same direction, and
+the turn went on unchanged.
+
+| Maze | Run 1 | Run 2 | Bar |
+|---|---|---|---|
+| L7 seed 1 | 59.9 | 59.9 | 59.5 / 59.2 |
+| L7 seed 2 | 88.4 | 86.9 | 86.5 / 86.7 |
+| L7 seed 3 | 78.5 | 79.8 | 78.8 / 78.6 |
+| L7 seed 4, random ends | 47.6 | 47.2 | 45.6 / 46.6 |
+| L9 seed 1 | 115.7 | 116.1 | 115.9 / 116.0 |
+| L9 seed 2 | 93.3 (slow steep-ramp climb, 9.0 s vs 6.7) | 174.5, 1 fall | 86.7 / 87.1 |
+| L9 seed 3 | 82.8 | 83.9 | 85.7 / 83.6 |
+| L9 seed 5, random ends | 79.6 | 80.1 | 80.0 / 83.2 |
+| **Total** | **645.8 s, 0 falls** | 728.4 s, 1 fall | 638.7 / 641.0 s, 0 falls |
+
+The run 2 fall is the trench in (8, 1) at 37.9 s: out of the corner (8, 0) → (8, 1) the robot was still accelerating
+and met the 0.20 m trench at about 0.74 m/s (the trench test: 3–8% falls at 0.7 m/s, 0% at 0.9). The `lost` rule did
+not fire in that run. It is the same "trench right after a corner or rough cell" risk as (4, 0) (section 5, item 1).
+
 ## 4. Gotchas learned the hard way
 
 - **Runs vary.** The same seed can differ by 50+ s. Never judge a change from one run.
@@ -495,8 +633,9 @@ at the (4, 0) trench (166.5 s). Stalls of 1 s or more: 2 in 22 runs, both lining
    is worse: 20–28% of robots snag at the pilot's 0.68 m/s, 4–8% at 0.9 m/s with no falls. `ROUGH_SPEED = 0.9` in the
    maze (section 3, "Rough floor at 0.9 m/s in the maze"), with the follow-up fixes for rough corners into ice, the
    trench approach and the stuck guard: 638.7 / 641.0 s, 0 falls (section 3, "Rough corners into ice, trench
-   approach, stuck guard"). **Open:** L9 seed 2's trench after a rough cell (1 fall in the latest 8 crossings, 0 in
-   32 with the old pilot), and the L7 seed 2 (3, 5) snag spot (a box on the curve's path, at any speed).
+   approach, stuck guard"). **Open:** L9 seed 2's trenches right after a rough cell or a corner: (4, 0) (1 fall in
+   the latest 8 crossings, 0 in 32 with the old pilot) and (8, 1) (1 fall on 2026-11-05, met at 0.74 m/s while still
+   accelerating out of the corner); and the L7 seed 2 (3, 5) snag spot (a box on the curve's path, at any speed).
    *Fixed 2026-11-03:*
    - **Steep-ramp stalls** (0.29–0.30 m; L9 seed 2 stalled in 4 of 16 runs, about 120 s each) came from climbing at
      0.70 m/s. Steep ramps are now climbed at 0.9 m/s (section 3, "Ramp test").
@@ -524,8 +663,10 @@ at the (4, 0) trench (166.5 s). Stalls of 1 s or more: 2 in 22 runs, both lining
 5. **Wall clearance in normal driving:** there is no body-width model. The turn-back has a 0.5 m lidar clearance check,
    but normal tracking and the unstuck reflex don't.
 6. **Slalom crossing speed:** the policy strafes at only about 0.18 m/s when commanded 0.30–0.35 (sideways test:
-   48–66% of the command, weaker to the right). `G1-Hazard-Challenge` trains sideways commands up to 0.5 m/s with a
-   tight sideways reward (section 3, "Policy training setup").
+   48–66% of the command, weaker to the right). `G1-Hazard-Challenge` training did not fix it without breaking slow
+   and backward walking (section 3, "Policy training setup"). If training is tried again: add a backward-walking
+   command kind and a tighter forward-speed reward, and gate on a slow / backward walking test as well as the
+   sideways, ice (180°), ramp and trench tests.
 7. **One unexplained fall** in a level 7 seed 2 repeat: its log was overwritten. If L7 seed 2 falls again, trace it.
    **Snags on rough floor** (stall ≥ 1 s with the chest raised: a foot on a loose box): 9 in 68 traced runs, all in or
    next to rough cells. L9 seed 5 random ends snags at the same spot (about (9.65, 4.4), lining up for the slalom at

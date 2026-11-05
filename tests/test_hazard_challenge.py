@@ -103,10 +103,18 @@ def test_each_command_kind_stays_in_its_range():
     assert vx.min() >= -0.25 and vx.max() <= 1.35 and vy.abs().max() <= 0.35 and wz.abs().max() <= 1.2
 
 
-def test_fast_kind_follows_the_forward_speed_curriculum():
-    """The curriculum widens ranges.lin_vel_x[1] from 0.85: fast commands never exceed it."""
-    vx = sample_targets(torch.full((2000,), FAST), _cmd_cfg(vx_max=0.85))[:, 0]
-    assert vx.min() >= 0.75 and vx.max() <= 0.85
+def test_fast_kind_reaches_the_pilot_cruise_speed_before_the_curriculum_does():
+    """The forward-speed curriculum starts at 0.85 and stayed there for 500 iterations of the first from-5600 run (ice
+    falls keep its tracking average under the threshold), yet the pilot cruises at 1.0 m/s: fast commands go to 1.1
+    m/s anyway, and further once the curriculum passes that."""
+    fast = torch.full((4000,), FAST)
+    vx = sample_targets(fast, _cmd_cfg(vx_max=0.85))[:, 0]
+    assert vx.min() >= 0.75 and vx.max() <= 1.1 and vx.max() > 1.05
+    assert (vx > 1.0).float().mean() > 0.2  # The pilot's cruise speed and above are well covered
+    vx = sample_targets(fast, _cmd_cfg(vx_max=1.35))[:, 0]
+    assert vx.max() > 1.3 and vx.max() <= 1.35
+    rnd = sample_targets(torch.full((4000,), RANDOM), _cmd_cfg(vx_max=0.85))[:, 0]
+    assert rnd.max() <= 0.85  # The random kind still follows the curriculum
 
 
 def test_mixed_kinds_get_their_own_values():
