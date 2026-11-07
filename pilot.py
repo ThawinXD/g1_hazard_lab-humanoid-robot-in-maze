@@ -51,6 +51,9 @@ PURSUIT_LOOKAHEAD = 1  # Pure-pursuit lookahead along the cell path [m] (sets ho
 TURN_DECIDE_DIST = 1.2  # Pick the next cell this far before the centre of a plain corner cell [m]
 LAT_ACC_MAX = 0.6  # Max sideways acceleration in a curve v^2 * kappa [m/s^2] (0.3 on ice)
 SLALOM_HOLD_U = -0.10  # Pelvis position along the corridor [m] while strafing across a slalom gap (gap is |u| < 0.30)
+STAGE_HOLD_U = 1.9  # Lining up sideways for a spike cell ahead: hold this far before its centre [m] (near the
+# previous cell's centre; at 1.4 the robot crept 0.5 m forward while stepping, ended 0.57 m before a slalom bed still in
+# line with it, and the turn toward the lane put a foot on the bed's corner: forced short route, L9 seed 1, 3 of 3 runs)
 ROUTE_REPLAN_MARGIN = 1.0  # Re-decide when the target's cost-to-goal rose by more than this (e.g. found a dead end)
 LIDAR_WALL_VOTES = 3  # Lidar hits on one cell edge (accumulated over scans) needed to latch it as a wall
 LIDAR_OPEN_VOTES = 2  # Lidar rays passing through an unknown cell edge needed to mark it open
@@ -768,7 +771,7 @@ class Pilot:
                 # the lane) the usual diagonal approach is safe, and staging there only cost time and steadiness
                 staging = v_now * bed_side > 0.15 and u_now < -1.0
                 if staging:
-                    u_entry = -1.4 * travel_sign
+                    u_entry = -STAGE_HOLD_U * travel_sign  # Step across near the previous cell's centre
                     # Get onto the lane by stepping sideways while facing down the corridor (act()'s strafe branch,
                     # forward speed held near zero): turning toward the point instead swung the robot into a wall on ice
                     self.strafe[env_id] = True

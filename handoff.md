@@ -11,7 +11,7 @@ Use this file to pick the work up in a new session. The full write-up of methods
 | Pilot | [pilot.py](pilot.py), 1,348 lines. Includes the dead-end fix, lidar wall mapping, turn-back on the spot, stuck-check guard and the fixes found in testing (develop.md §4.8), plus (2026-11-02) trench crossing at 0.9 m/s and the stall-blame rule (section 5, item 7), and (2026-11-03) steep ramps climbed at 0.9 m/s after a 1 m run-up (section 3, "Ramp test") and ice turns decided at the ice edge (section 3, "Ice turn test"). The 2026-11-03 spike-entry and rough-floor turn experiments were reverted (section 3, "Spike-lane corners"; section 4). |
 | Training setup | `G1-Hazard-Challenge` (real ice, pilot-like commands, sideways reward, harder hazards) plus the sideways and rough-floor tests, built 2026-11-03. **Tried 2026-11-04/05 and dropped: `model_8497` stays the policy.** Two runs (from `model_5600`, 3,000 iterations; from `model_8497`, 1,500) gave checkpoints much better on trenches and ramps, but each had a new weakness: long ice turns (late checkpoints), weak sideways steps (`model_7500`: 1152.5 s, 6 resets on the benchmark) or forward drift at slow / backward commands (`model_9500`: 1012.4 / 901.8 s, 5 / 3 resets, every level 9 slalom hit; otherwise 4–5% faster). See section 3, "Policy training setup". Challenge day: Saturday 2026-11-14. |
 | Pilot changes (2026-11-04) | In the working tree, **not committed**: rough-floor speed 0.9 (`ROUGH_SPEED`), turn-backs moved off rough floor (`PIVOT_ROUGH_EXIT`), rough corners into ice at rough speed (`ICE_SLOW_DIST`), the old 0.68 before trenches, and the stuck guard using measured velocity. Benchmark **638.7 s and 641.0 s, 0 falls** (bar 685 / 685); residual risk at L9 seed 2's trench (section 3, "Rough corners into ice, trench approach, stuck guard"). Plus (2026-11-05) the re-decide when a late turn ends in the next cell (`lost`, L9 seed 50): seed 50 crash gone in 3 of 3 runs, benchmark 645.8 s / 0 falls and 728.4 s / 1 trench fall not caused by it (section 3, "Late turn that ends in the next cell"). |
-| Tests | `uv run pytest tests`: **104 pass** (no simulator needed). |
+| Tests | `uv run pytest tests`: **105 pass** (no simulator needed). |
 | Git | Branch `side-test`. Everything through the 2026-11-03 ramp and ice-turn work is committed (`git log` for the latest commit; `tools/` and `logs/` are git-ignored, so the checkpoint is not in git). The training setup is not committed yet. Ask before committing. |
 | Submission | Upload `model_8497.pt` as `policy.pt` plus `pilot.py`. `PILOT_MODE` already defaults to `short` (the runner sets no env vars). |
 
@@ -278,8 +278,11 @@ extra rules:
 
 The user didn't like this way of entering spike cells, so `pilot.py` is back to the 685 s version's entry. That is the
 diagonal pre-alignment to the lane's entry point, with sideways staging when on the bed's side. A copy of the
-lane-arc version was kept only in that session's scratchpad. **The outside-lane corner problem on the short route is
-open again** (spike hits on forced L7 seed 3 / L9 seed 1).
+lane-arc version was kept only in that session's scratchpad. The outside-lane corner problem on the short route
+(spike hits on forced L7 seed 3 / L9 seed 1) was **fixed on 2026-11-07 by staging further back** (`STAGE_HOLD_U`,
+section "Lining up for a spike cell from the bed's side"). The forced-route wrapper is `tools/force_route.py`
+(git-ignored, reads the real map: `FORCE_SRC=<pilot snapshot> FORCE_ROUTE=short PILOT_SRC=tools/force_route.py`
+with `--pilot tools/trace_pilot.py`); never copy it into `pilot.py`.
 
 Which kind each benchmark corner is (from the traces):
 - **Lane outside:** L7 seed 3 (1, 1) → (1, 2) and (2, 6) → (3, 6); L7 seed 4 (2, 4) → (3, 4); L9 seed 2 (4, 6) → (4, 5)
@@ -579,6 +582,41 @@ The run 2 fall is the trench in (8, 1) at 37.9 s: out of the corner (8, 0) → (
 and met the 0.20 m trench at about 0.74 m/s (the trench test: 3–8% falls at 0.7 m/s, 0% at 0.9). The `lost` rule did
 not fire in that run. It is the same "trench right after a corner or rough cell" risk as (4, 0) (section 5, item 1).
 
+### Lining up for a spike cell from the bed's side: hold back (2026-11-07, in the working tree)
+
+**Problem (forced short route, L9 seed 1, 3 of 3 runs hit).** Off the ice heading east into the rough corner (4, 4),
+the slalom (4, 5) has its entry lane on the outside of the turn (x = 8.48); bed 1 covers x 7.08–7.94 from y = 9.1.
+Staging (sideways steps toward the lane, section "Spike-lane corners") held the robot at u = −1.4 before the slalom's
+centre, so while stepping across it also crept forward at up to 0.12 m/s: from u = −1.96 to −1.47. Staging ends 0.15 m
+short of the centreline, so it stopped 0.57 m before the bed and still in line with it (x = 7.87); the diagonal toward
+the lane started with a 35° right turn while walking at 0.25–0.47 m/s, and the left foot hit the bed's corner (40.8 /
+45.7 / 41.1 s; run 2 first stalled 3 s against it).
+
+**Fix:** `STAGE_HOLD_U = 1.9` (was 1.4): the staging point sits near the previous cell's centre, so the robot steps
+across without creeping on and the diagonal starts with 1.15 m of room instead of 0.72 m. Test:
+`test_slalom_staging_steps_across_without_creeping_toward_the_bed`.
+
+**Result.** Forced L9 seed 1: 116.7 / 116.1 / 115.4 s, 0 falls (staging held y at 8.02–8.20; in the gap the pelvis
+stayed at u −0.16…+0.03; lowest lidar 0.31–0.34 m, at the east wall beside the lane). Forced L7 seed 3: 60.2 / 56.0 s,
+0 falls (the old entry: 113.0 s / 1 fall and 96.3 s / 2 falls). Benchmark (normal routes):
+
+| Maze | Run 1 | Run 2 | Bar |
+|---|---|---|---|
+| L7 seed 1 | 58.9 | 59.4 | 59.5 / 59.2 |
+| L7 seed 2 | 86.8 | 86.9 | 86.5 / 86.7 |
+| L7 seed 3 | 79.5 | 79.7 | 78.8 / 78.6 |
+| L7 seed 4, random ends | 47.0 | 47.0 | 45.6 / 46.6 |
+| L9 seed 1 | 115.5 | 115.8 | 115.9 / 116.0 |
+| L9 seed 2 | 89.1 | 89.4 | 86.7 / 87.1 |
+| L9 seed 3 | 84.4 | 83.9 | 85.7 / 83.6 |
+| L9 seed 5, random ends | 78.1 | 86.9 | 80.0 / 83.2 |
+| **Total** | **639.3 s, 0 falls** | **649.0 s, 0 falls** | 638.7 / 641.0 s, 0 falls |
+
+**Cost:** the longer diagonal (pre-alignment runs at ≤ 0.5 m/s) adds about 1.5–2 s at each outside-lane spike corner
+the normal routes use: L9 seed 2 (8, 4) → (7, 4) 7.6 → 9.6 s of pre-alignment, L7 seed 4 3.8 → 5.0 s. Run 2's L9 seed
+5 (+3.7 s) was more exploring (12.4 s vs 9–11) and a late turn, not the spike entry. The rough-floor wall crashes of
+the rejected longer-staging attempts did not appear.
+
 ## 4. Gotchas learned the hard way
 
 - **Runs vary.** The same seed can differ by 50+ s. Never judge a change from one run.
@@ -646,8 +684,9 @@ not fire in that run. It is the same "trench right after a corner or rough cell"
    route, because `choose_direction` breaks the tie toward the cell it faces (unknown cells are priced as nearly plain).
    Clean short-route times with the route forced: L7 seed 1 ~54 s, seed 2 ~45 s, seed 3 ~58–62 s, L9 seed 1 ~130 s,
    against 63 / 91 / 82 / 122 s on the long route. Counting a ~10–18 s detour to look into the fork first, the gain is
-   about 17 s per 8-maze set. First the short route needs a safe entry at corners whose spike lane is on the outside
-   of the turn: today those give spike hits (section 3, "Spike-lane corners"). The pilot may only use what it senses
+   about 17 s per 8-maze set. The safe entry at corners whose spike lane is on the outside of the turn now exists
+   (`STAGE_HOLD_U`, 2026-11-07): forced short routes L7 seed 3 56.0–60.2 s (long route ~79 s) and L9 seed 1
+   115.4–116.7 s (long route ~116 s), 0 falls in 5 runs. The pilot may only use what it senses
    (the generator's public rules: the short route is ≥ 6 cells shorter and its first hard hazard is within 3 cells),
    never the real map.
 3. **Speed tuning** (list in develop.md / the earlier discussion). Raise one at a time and re-run the benchmark:

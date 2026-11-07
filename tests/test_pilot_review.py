@@ -38,6 +38,7 @@ from pilot import (  # noqa: E402
     PIVOT_TURN_RATE_ICE,
     RAMP_RUNUP,
     ROUGH_SPEED,
+    STAGE_HOLD_U,
     STEEP_RAMP_SPEED,
     TRENCH_CLEAR_U,
     TRENCH_SPEED,
@@ -557,6 +558,26 @@ def test_spike_lane_lined_up_before_the_bed_when_far_off_lane(monkeypatch):
     wp, _, _ = p._compute_waypoint_and_speed(0, torch.tensor([8.9, 9.9]), -1.57, torch.tensor([4, 5]), xy, torch.zeros(len(xy)))
     assert abs(float(wp[0]) - 7.52) < 0.05 and float(wp[1]) >= 9.3, f"pre-align point {wp.tolist()} cuts toward the bed"
     assert bool(p.strafe[0]), "lines up by turning toward the point instead of stepping sideways"
+
+
+def test_slalom_staging_steps_across_without_creeping_toward_the_bed(monkeypatch):
+    """Forced short route, level 9 seed 1: off the ice heading east into corner (4, 4), the slalom (4, 5) north of it
+    has its entry lane on the outside of the turn (x = 8.48) and bed 1 at x < 7.94 from y = 9.1. Staging must hold the
+    robot near the corner cell's centre while it steps across (it used to creep to y = 8.55, 0.57 m before the bed,
+    and the turn toward the lane put a foot on the bed's corner in 3 of 3 runs)."""
+    p = _pilot(monkeypatch)
+    p.cell_type[0, 4, 5] = CELL_SPIKE_SLALOM
+    p.cell_axis[0, 4, 5] = 1
+    p.safe_offset[0, 4, 5, 0] = 0.48  # Entry half (y < 10): bed on -x, lane on +x
+    p.safe_offset[0, 4, 5, 1] = -0.48  # Exit half: bed on +x, lane on -x
+    _set_plan(p, origin=(4, 4), target=(4, 5), heading=1)
+    pos = torch.tensor([7.09, 8.03])  # Just off the ice, 0.99 m on the bed's side of the slalom's centreline
+    xy = _grid(7.09, 8.03)
+    wp, _, _ = p._compute_waypoint_and_speed(0, pos, 0.0, torch.tensor([4, 4]), xy, torch.zeros(len(xy)))
+    assert bool(p.strafe[0]), "not lining up sideways from the bed's side"
+    assert abs(float(wp[0]) - 8.48) < 0.01, f"staging point {wp.tolist()} is not on the entry lane"
+    assert abs(float(wp[1]) - (10.0 - STAGE_HOLD_U)) < 0.01, f"staging point {wp.tolist()} creeps toward the bed"
+    assert 10.0 - STAGE_HOLD_U <= 8.15, "staging hold point not near the corner cell's centre"
 
 
 def test_no_lane_staging_when_off_lane_on_the_wall_side(monkeypatch):
