@@ -261,6 +261,25 @@ def test_slalom_does_not_advance_into_second_bed_before_crossing(monkeypatch):
     )
 
 
+def test_slalom_past_the_gap_off_lane_walks_on_not_back_along_the_bed(monkeypatch):
+    """Level 9 seed 3 random ends (forced short route): snagged at the slalom's exit, the unstuck reflex pushed the
+    robot back to u = +0.61 and 0.28 m off the exit lane. Stage 2 then strafed it back toward the gap (u = -0.10)
+    along bed 2 into the spikes. Past the gap it must walk on toward the exit lane instead."""
+    p = _pilot(monkeypatch)
+    p.cell_type[0, 2, 0] = CELL_SPIKE_SLALOM
+    p.cell_axis[0, 2, 0] = 0
+    p.safe_offset[0, 2, 0, 0] = -0.48  # u < 0 half: free lane on -y (bed 1 on +y)
+    p.safe_offset[0, 2, 0, 1] = 0.48  # u > 0 half: free lane on +y (bed 2 on -y)
+    _set_plan(p, origin=(2, 0), target=(3, 0), heading=0)
+    x, y = 4.61, 0.20  # u = +0.61, 0.28 m off the exit lane toward bed 2
+    xy = _grid(x, y)
+    z = _bed(xy, 2, 0, side=+1, u0=-0.9, u1=-0.3) + _bed(xy, 2, 0, side=-1, u0=0.3, u1=0.9)
+    wp, _, _ = p._compute_waypoint_and_speed(0, torch.tensor([x, y]), 0.3, torch.tensor([2, 0]), xy, z)
+    assert not bool(p.strafe[0]), "strafing back toward the gap along bed 2"
+    assert float(wp[0]) - 2 * CELL >= 0.95, f"waypoint {wp.tolist()} is not ahead past the bed"
+    assert abs(float(wp[1]) - 0.48) < 0.01, f"waypoint {wp.tolist()} is not on the exit lane"
+
+
 # ----------------------------------------------------------------------------- review #4
 def test_unstuck_reflex_never_strafes_toward_spike_bed(monkeypatch):
     """Review #4: the unstuck reflex strafes +-0.20 m/s, flipping side every time, whatever is next to it.
@@ -282,6 +301,73 @@ def test_unstuck_reflex_never_strafes_toward_spike_bed(monkeypatch):
     assert all(vy * side <= 0.0 for vy in vys), (
         f"unstuck v_y commands {vys} (robot frame, facing +x): at least one strafes toward the spike bed on +y"
     )
+
+
+def test_unstuck_reflex_does_not_turn_in_a_spike_cell(monkeypatch):
+    """Level 9 seed 3 random ends: snagged at a slalom's exit, the reflex turned 40 deg while backing up and the rear
+    swung into the bed beside the lane. In a spike cell it backs up facing down the corridor, stepping away from the
+    cones; elsewhere it still turns."""
+    p = _pilot(monkeypatch)
+    p.cell_type[0, 2, 0] = CELL_SPIKE_LANE
+    pos = (4.0, -0.45)  # In the free lane of (2, 0), bed on +y
+    _set_plan(p, origin=(2, 0), target=(3, 0), heading=0)
+    p.pos_anchor[0] = torch.tensor(pos)
+    cmd = p.act(_obs(pos, lambda xy: _bed(xy, 2, 0, side=+1, u0=-0.7, u1=0.7), t=10.0))
+    assert float(p.unstuck_until[0]) > 10.0, "setup: the unstuck reflex should have fired"
+    assert float(cmd[0, 0]) < 0.0 and float(cmd[0, 1]) <= 0.0, f"reflex {cmd[0].tolist()} not backing away from the bed"
+    assert float(cmd[0, 2]) == 0.0, f"reflex turns at {float(cmd[0, 2]):.2f} rad/s in a spike cell"
+
+    p = _pilot(monkeypatch)  # Plain cell: the reflex still turns to free the feet
+    _set_plan(p, origin=(2, 0), target=(3, 0), heading=0)
+    p.pos_anchor[0] = torch.tensor(pos)
+    cmd = p.act(_obs(pos, lambda xy: torch.zeros(len(xy)), t=10.0))
+    assert abs(float(cmd[0, 2])) == 0.75, "reflex no longer turns on plain floor"
+
+
+def _choose(p: Pilot, cell, heading: int, open_dirs) -> int:
+    """choose_direction for robot 0 in ``cell`` facing ``heading`` with the given open sides (DIRS indices)."""
+    sides = torch.zeros(1, 4, dtype=torch.bool)
+    sides[0, list(open_dirs)] = True
+    return int(p.choose_direction(torch.tensor([cell]), sides, torch.tensor([heading]))[0])
+
+
+def test_junction_prefers_the_branch_that_shows_a_route_hazard(monkeypatch):
+    """Short mode, junction (2, 2) facing north: north (2, 3) unknown and east (3, 2) a spike lane are equally far from
+    the goal (6, 6). The plain cost picks north (spike lanes cost more); the generator only puts spike lanes, trenches,
+    slaloms and ramps on start-goal routes, so east cannot be a dead end and is taken. Auto mode keeps avoiding it."""
+    for mode, expect in (("short", 0), ("auto", 1)):
+        p = _pilot(monkeypatch, mode=mode)
+        p._set_cell_hazard(0, 3, 2, CELL_SPIKE_LANE)
+        assert _choose(p, (2, 2), 1, (0, 1)) == expect, f"{mode} mode: wrong branch at the junction"
+
+    p = _pilot(monkeypatch, mode="short")  # Loose boxes: the short route's fill, a weaker hint
+    p._set_cell_hazard(0, 3, 2, CELL_ROUGH)
+    assert _choose(p, (2, 2), 1, (0, 1)) == 0, "rough branch (short route fill) not preferred over unknown"
+
+
+def test_route_hint_never_overrides_death_penalties_or_points_back(monkeypatch):
+    """No credit for a hazard cell the robot already fell in (+50), nor for the way back (the route behind leads to
+    the start)."""
+    p = _pilot(monkeypatch, mode="short")
+    p._set_cell_hazard(0, 3, 2, CELL_SPIKE_LANE)
+    p.cell_deaths[0, 3, 2] = 1.0
+    p.cell_cost[0, 3, 2] += 50.0
+    assert _choose(p, (2, 2), 1, (0, 1)) == 1, "went back into the spike lane it fell in"
+
+    p = _pilot(monkeypatch, mode="short")
+    p._set_cell_hazard(0, 2, 1, CELL_SPIKE_LANE)  # Behind the robot (it came from the south)
+    assert _choose(p, (2, 2), 1, (1, 3)) == 1, "turned back toward a hazard behind the robot"
+
+    # Level 9 seed 10 random ends: a route hazard on a step away from the goal may be the route's way back to the start
+    p = _pilot(monkeypatch, mode="short")
+    p._set_cell_hazard(0, 1, 2, CELL_SPIKE_LANE)  # West of (2, 2), one step farther from the goal (6, 6)
+    assert _choose(p, (2, 2), 1, (1, 2)) == 1, "followed a route hazard away from the goal"
+
+    # Level 9 seed 5: back out of a dead end, facing the way it came: a hazard it already crossed is no clue
+    p = _pilot(monkeypatch, mode="short")
+    p._set_cell_hazard(0, 3, 2, CELL_LOW_RAMP)
+    p.visited[0, 3, 2] = True
+    assert _choose(p, (2, 2), 1, (0, 1)) == 1, "went back over a hazard it had already crossed"
 
 
 # ----------------------------------------------------------------------------- review #5
@@ -760,14 +846,14 @@ def test_ice_corner_turn_starts_at_the_ice_edge(monkeypatch):
     assert int(p.ap.heading[0]) == 1, "turn not decided on entering the ice corner"
     assert int(p.pivot_state[0]) > 0, "no turn on the spot started at the ice edge"
 
-    # A slalom after the corner: stopping at the ice edge would leave the robot ~1 m from an outside lane (level 9
-    # seed 3 hit the slalom lining up from there), so the turn waits for the old place, 0.5 m from the centre
+    # Also with a slalom after the corner: lining up from the inside of the turn holds back (STAGE_HOLD_U), while
+    # waiting to turn 0.5 m from the centre rotated on the middle of the ice and fell (2 of 8 forced runs)
     p = _pilot(monkeypatch)
     p.cell_type[0, 2, 0], p.cell_type[0, 2, 1] = CELL_ICE, CELL_SPIKE_SLALOM
     p.ap.walls[0, 2, 0] = torch.tensor([1, 0, 0, 1])
     _set_plan(p, origin=(1, 0), target=(2, 0), heading=0)
     p.act(_obs((3.05, 0.0), ice, t=1.0))
-    assert int(p.ap.heading[0]) == 0 and int(p.pivot_state[0]) == 0, "turned at the ice edge before a slalom"
+    assert int(p.ap.heading[0]) == 1 and int(p.pivot_state[0]) > 0, "waited to turn on the middle of the ice"
 
 
 def test_ice_turn_brakes_and_rotates_at_the_ice_limits(monkeypatch):

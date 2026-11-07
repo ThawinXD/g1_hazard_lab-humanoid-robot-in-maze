@@ -11,7 +11,9 @@ Use this file to pick the work up in a new session. The full write-up of methods
 | Pilot | [pilot.py](pilot.py), 1,348 lines. Includes the dead-end fix, lidar wall mapping, turn-back on the spot, stuck-check guard and the fixes found in testing (develop.md §4.8), plus (2026-11-02) trench crossing at 0.9 m/s and the stall-blame rule (section 5, item 7), and (2026-11-03) steep ramps climbed at 0.9 m/s after a 1 m run-up (section 3, "Ramp test") and ice turns decided at the ice edge (section 3, "Ice turn test"). The 2026-11-03 spike-entry and rough-floor turn experiments were reverted (section 3, "Spike-lane corners"; section 4). |
 | Training setup | `G1-Hazard-Challenge` (real ice, pilot-like commands, sideways reward, harder hazards) plus the sideways and rough-floor tests, built 2026-11-03. **Tried 2026-11-04/05 and dropped: `model_8497` stays the policy.** Two runs (from `model_5600`, 3,000 iterations; from `model_8497`, 1,500) gave checkpoints much better on trenches and ramps, but each had a new weakness: long ice turns (late checkpoints), weak sideways steps (`model_7500`: 1152.5 s, 6 resets on the benchmark) or forward drift at slow / backward commands (`model_9500`: 1012.4 / 901.8 s, 5 / 3 resets, every level 9 slalom hit; otherwise 4–5% faster). See section 3, "Policy training setup". Challenge day: Saturday 2026-11-14. |
 | Pilot changes (2026-11-04) | In the working tree, **not committed**: rough-floor speed 0.9 (`ROUGH_SPEED`), turn-backs moved off rough floor (`PIVOT_ROUGH_EXIT`), rough corners into ice at rough speed (`ICE_SLOW_DIST`), the old 0.68 before trenches, and the stuck guard using measured velocity. Benchmark **638.7 s and 641.0 s, 0 falls** (bar 685 / 685); residual risk at L9 seed 2's trench (section 3, "Rough corners into ice, trench approach, stuck guard"). Plus (2026-11-05) the re-decide when a late turn ends in the next cell (`lost`, L9 seed 50): seed 50 crash gone in 3 of 3 runs, benchmark 645.8 s / 0 falls and 728.4 s / 1 trench fall not caused by it (section 3, "Late turn that ends in the next cell"). |
-| Tests | `uv run pytest tests`: **105 pass** (no simulator needed). |
+| Pilot changes (2026-11-07, in the working tree) | Ice turns always at the ice edge, slalom stage 2 only inside the gap, unstuck reflex without turning in spike cells. Slalom sweep over 8 mazes' entries (0 spike hits in 7 crossings); benchmark 645.8 / 644.6 / 655.6 s, 0 falls (section 3, "Slalom sweep, ice turns at the edge, ..."). |
+| Route hints (2026-11-08, in the working tree) | At a junction, prefer a branch whose next cell shows a hazard only routes carry (or loose boxes): exploring −8% on six extra mazes, no decision changed on 7 of the 8 benchmark mazes (section 3, "Route hints at junctions"). |
+| Tests | `uv run pytest tests`: **109 pass** (no simulator needed). |
 | Git | Branch `side-test`. Everything through the 2026-11-03 ramp and ice-turn work is committed (`git log` for the latest commit; `tools/` and `logs/` are git-ignored, so the checkpoint is not in git). The training setup is not committed yet. Ask before committing. |
 | Submission | Upload `model_8497.pt` as `policy.pt` plus `pilot.py`. `PILOT_MODE` already defaults to `short` (the runner sets no env vars). |
 
@@ -582,7 +584,7 @@ The run 2 fall is the trench in (8, 1) at 37.9 s: out of the corner (8, 0) → (
 and met the 0.20 m trench at about 0.74 m/s (the trench test: 3–8% falls at 0.7 m/s, 0% at 0.9). The `lost` rule did
 not fire in that run. It is the same "trench right after a corner or rough cell" risk as (4, 0) (section 5, item 1).
 
-### Lining up for a spike cell from the bed's side: hold back (2026-11-07, in the working tree)
+### Lining up for a spike cell from the bed's side: hold back (2026-11-07, committed `14f11b2`)
 
 **Problem (forced short route, L9 seed 1, 3 of 3 runs hit).** Off the ice heading east into the rough corner (4, 4),
 the slalom (4, 5) has its entry lane on the outside of the turn (x = 8.48); bed 1 covers x 7.08–7.94 from y = 9.1.
@@ -616,6 +618,102 @@ stayed at u −0.16…+0.03; lowest lidar 0.31–0.34 m, at the east wall beside
 the normal routes use: L9 seed 2 (8, 4) → (7, 4) 7.6 → 9.6 s of pre-alignment, L7 seed 4 3.8 → 5.0 s. Run 2's L9 seed
 5 (+3.7 s) was more exploring (12.4 s vs 9–11) and a late turn, not the spike entry. The rough-floor wall crashes of
 the rejected longer-staging attempts did not appear.
+
+### Slalom sweep, ice turns at the edge, slalom exit, unstuck reflex in spike cells (2026-11-07, in the working tree)
+
+The final level has a slalom on **both** routes and random ends, so every way into a slalom matters.
+`tools/slalom_scan.py` (git-ignored, reads the real map) builds the challenge mazes offline (no simulator; matches the
+runs exactly) and lists how each slalom is entered: `uv run python tools/slalom_scan.py 9 1 60` (list for seeds 1–60,
+with and without random ends, in `logs/slalom_scan_L9.txt`). Of 117 slaloms: 35% entered straight, 40% from a corner
+with the entry lane on the outside of the turn, 25% inside; almost all from rough floor, a few from ice; every one
+exits straight.
+
+**Sweep (forced short route, one run each):** L9 seed 5 (rough, right, outside), seed 2 random ends (rough, right,
+outside, after a steep ramp), seed 9 (rough, right, inside), seed 15 (rough, left, inside), seed 3 random ends (ice,
+left, inside), seed 22 (ice, right, outside), seed 4 (rough, left, outside), seed 50 (rough, right, inside): **7
+slalom crossings, 0 spike hits** (10–13 s each, nearest 0.32–0.36 m). Three resets elsewhere led to the fixes below.
+
+1. **Ice turns always at the ice edge (removed `ice_wait`).** An ice corner next to any spike cell used to wait and
+   turn 0.5 m from the centre, on the middle of the ice (the 7–10% case of the ice-corner test). Seed 4 (1, 5) and
+   seed 2 random ends (4, 2) fell there; they had rotated 0.10–0.15 m from the centre. Now they rotate 0.54–0.65 m from
+   it: 0 falls in 4 runs. The reason for the wait (lining up from the inside of the turn hit L9 seed 3's slalom (6, 1))
+   is gone with `STAGE_HOLD_U`: L9 seed 3 (normal route) 87.8 / 86.5 / 89.1 / 87.2 / 87.5 s, 0 falls, at about +3 s.
+2. **Slalom stage 2 only inside the gap (`u_rel < 0.30`, was 0.95).** Seed 3 random ends, snagged on rough floor at
+   the slalom's exit (pelvis u ≈ +0.95, this happens in about half of its runs): the unstuck reflex pushed it back to
+   u = +0.61, 0.28 m off the exit lane, and stage 2 then strafed it back toward the gap along bed 2 into the spikes.
+   Past the gap, stage 3 now walks on toward the exit lane (away from that bed).
+3. **Unstuck reflex does not turn in a spike lane / slalom cell.** The same snag again: backing up while turning 40°
+   swung the rear into bed 2 (its momentum, −0.32 m/s, carried on after the reflex). Now it backs up straight and
+   steps away from the cones: seed 3 random ends 87.6 / 85.6 / 94.4 (snag at the exit, backed up straight, went on) /
+   87.1 s, 0 falls (was 2 spike hits in 3 runs with a snag).
+Tests: `test_ice_corner_turn_starts_at_the_ice_edge` (slalom case flipped),
+`test_slalom_past_the_gap_off_lane_walks_on_not_back_along_the_bed`, `test_unstuck_reflex_does_not_turn_in_a_spike_cell`.
+
+**Benchmark (normal routes):**
+
+| Maze | 1 + 2, run 1 | 1 + 2, run 2 | 1 + 2 + 3 | Bar |
+|---|---|---|---|---|
+| L7 seed 1 | 59.4 | 59.5 | 59.0 | 59.5 / 59.2 |
+| L7 seed 2 | 86.0 | 85.5 | 85.6 | 86.5 / 86.7 |
+| L7 seed 3 | 79.1 | 78.5 | 79.0 | 78.8 / 78.6 |
+| L7 seed 4, random ends | 47.2 | 47.3 | 46.8 | 45.6 / 46.6 |
+| L9 seed 1 | 116.1 | 116.5 | 116.0 | 115.9 / 116.0 |
+| L9 seed 2 | 88.8 | 87.7 | 92.5 | 86.7 / 87.1 |
+| L9 seed 3 | 89.1 | 87.2 | 87.5 | 85.7 / 83.6 |
+| L9 seed 5, random ends | 80.1 | 82.4 | 89.2 (known rough snag before the slalom) | 80.0 / 83.2 |
+| **Total** | **645.8 s, 0 falls** | **644.6 s, 0 falls** | **655.6 s, 0 falls** | 638.7 / 641.0 s |
+
+No new falls; about 4–7 s per set slower than the bar, from the safer spike entries (L9 seed 2 about +2 s, L9 seed 3
+about +3 s). The removed failures cost 100+ s each when they happen, and the final level has more slaloms.
+
+**Trenches (analysis only, no change).** 115 trench crossings in the recent `model_8497` traces: 5 falls (4%), 4 of
+them at L9 seed 2's two 0.20 m trenches after rough floor ((4, 0), (8, 1)), one at L9 seed 22's 0.22 m trench (4, 5)
+right after a trench and a corner. Corner or straight before makes no difference (3 / 59 vs 2 / 56). Speed at the line
+looks protective (≥ 0.8 m/s: 1 / 74; < 0.8: 4 / 41), but the measured speed includes the stumble itself, and running
+the rough cell before (4, 0) at 0.9 m/s had given 3 falls in 14. No clean pilot lever; the policy is the limit
+(trench test: 0.22 m at 0.9 m/s, 13–16% falls).
+
+### Route hints at junctions (2026-11-08, in the working tree)
+
+**Idea (the user's):** the generator puts trenches, steep ramps, slaloms, spike lanes and low ramps only on the
+start–goal routes, fills the short route's plain cells with loose boxes, and gives cells off both routes only a few
+extra ice / rough cells. So a branch that shows such a hazard is not a dead end. `tools/route_stats.py` (git-ignored,
+offline) over 117 level 9 mazes: short-route cells rough 58%, hazards 32%; long-route cells plain 64%; off-route cells
+plain 87%, ice 9%, rough 4%, never a hazard. At 770 junctions into a dead-end branch, the branch's first cell was plain
+87% of the time; the route's next cell was a hazard in 26%, rough (vs a plain branch) in another 20%. The pilot's
+floor scan reaches 1.6 m, so at a junction it usually knows the near half of each neighbouring cell (not a trench line
+in the middle of a side cell).
+
+**Rule (`choose_direction` → `_route_hint`, short mode only):** a cost credit for a direction whose next cell holds one
+of those hazards (`ROUTE_HINT_BONUS = 3.0`) or loose boxes (`ROUTE_HINT_ROUGH = 1.0`), half for the cell beyond it in
+a straight line. No credit for going back, for a cell with a death / stall penalty, for a cell already visited
+(`self.visited`, kept across resets), or for a step that does not bring the robot closer to the goal (Manhattan). The
+last two came from runs: v1 sent L9 seed 5 back over a low ramp it had crossed (8 s) and L9 seed 10 random ends into a
+spike lane on the long route's stretch back to the start (12 s); a route runs both ways.
+Tests: `test_junction_prefers_the_branch_that_shows_a_route_hazard`,
+`test_route_hint_never_overrides_death_penalties_or_points_back`.
+
+**Six extra mazes (one run each, exploring time from `tools/time_breakdown.py`):**
+
+| Maze | No hints | v1 | v3 (final) |
+|---|---|---|---|
+| L9 seed 50 | 160.5 s / 51.6 | 142.8 / 31.8 | **143.0 / 31.4** |
+| L9 seed 5 | 172.0 / 87.5 | 176.7 / 83.1 | **167.6 / 76.8** |
+| L9 seed 6 random ends | 123.5 / 47.4 | 126.4 / 48.7 | 126.5 / 52.6 |
+| L9 seed 8 random ends | 110.7 / 24.3 | 113.8 / 30.1 | 214.0, 2 resets / 28.5 |
+| L9 seed 10 random ends | 145.7 / 42.2 | 158.0 / 50.7 | 146.9 / 42.2 |
+| L9 seed 31 random ends | 157.0 / 24.9 | 126.0 / 10.6 | 142.1 / 25.2 |
+
+v3 explored 256.7 s against 277.9 s (−8%); the five mazes without a reset took 726.1 s against 758.7 s (−4%).
+Seed 8's two resets were not routing: a 0.21 m trench right after ice (crossed at 0.66 m/s) and, on the long route
+after that, a stumble on rough floor that slid the robot back into a spike bed.
+
+**Benchmark:** 835.2 s (2 falls) / 653.2 s (0 falls). The hints change **no decision** in 7 of the 8 mazes (decision
+sequences identical to the runs without hints); L9 seed 5 random ends takes (5, 4) → (6, 4) instead of (5, 5),
+81.9 / 81.5 s. The two falls (L9 seed 3, run 1) came on the unchanged path: a stumble in the rough corner (8, 4) at
+walking pace (0–0.25 m/s while turning), and, after that reset, sideways staging on the rough cell (5, 6) that
+stumbled into the wall; run 2 of that maze was clean (85.2 s). L9 seed 2 run 2 (97.7 s) had a snag and the unstuck
+reflex on the same route.
 
 ## 4. Gotchas learned the hard way
 
@@ -678,8 +776,8 @@ the rejected longer-staging attempts did not appear.
    - **Steep-ramp stalls** (0.29–0.30 m; L9 seed 2 stalled in 4 of 16 runs, about 120 s each) came from climbing at
      0.70 m/s. Steep ramps are now climbed at 0.9 m/s (section 3, "Ramp test").
    - **Ice turn-on-the-spot falls** (5% of ice turns) came from rotating on the middle of the ice. The turn is now
-     decided on entering the ice cell, so the robot rotates near the edge (section 3, "Ice turn test"). Ice corners
-     next to spike cells still turn at the old place; they had 2 falls in 32 turns before.
+     decided on entering the ice cell, so the robot rotates near the edge (section 3, "Ice turn test"). Since
+     2026-11-07 also next to spike cells (they had kept the old place and fell in 2 of 8 forced runs).
 2. **Route choice at the fork.** In 4 of the 8 benchmark mazes (L7 seeds 1–3, L9 seed 1) the robot drives the long
    route, because `choose_direction` breaks the tie toward the cell it faces (unknown cells are priced as nearly plain).
    Clean short-route times with the route forced: L7 seed 1 ~54 s, seed 2 ~45 s, seed 3 ~58–62 s, L9 seed 1 ~130 s,

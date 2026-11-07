@@ -84,6 +84,15 @@ STUCK_GUARD_WINDOW = 1.5  # Look ahead this long before each check [s]
 STUCK_GUARD_DIST = 0.35  # Keep at least this far from the previous check's position at check time [m]
 STUCK_BLAME_DIST = 0.5  # A stall blames a ramp / trench target only when the pelvis is this close to its edge [m]
 
+# Junction choice: the maze generator puts trenches, steep ramps, slaloms, spike lanes and low ramps only on the routes
+# from start to goal, fills the short route's plain cells with loose boxes, and gives cells off both routes (dead-end
+# branches) at most a few extra ice / rough cells. Over 117 level 9 mazes the first cell of a dead-end branch was plain
+# in 87% of 770 junctions, never one of those hazards; the route's next cell was a hazard in 26% and rough (vs a plain
+# branch) in another 20%
+ROUTE_HAZARD_TYPES = (CELL_LOW_RAMP, CELL_SPIKE_LANE, CELL_SPIKE_SLALOM, CELL_TRENCH, CELL_STEEP_RAMP)  # Route only
+ROUTE_HINT_BONUS = 3.0  # Cost credit at a junction for a next cell holding one of them (half for the cell beyond)
+ROUTE_HINT_ROUGH = 1.0  # Smaller credit for a rough next cell (short route fill; 4% of dead-end cells)
+
 COSTS_SHORT = {
     CELL_UNKNOWN: 1.05,  # Unexplored cell cost
     CELL_PLAIN: 1.0,  # Plain cell cost
@@ -129,6 +138,7 @@ class Pilot:
         # mode = os.environ.get("PILOT_MODE", "auto").lower()  # Read route preference mode from env var
         mode = os.environ.get("PILOT_MODE", "short").lower()  # Read route preference mode from env var
         self.cost_table = COSTS_SHORT if mode == "short" else COSTS_AUTO  # Pick cost table for mode
+        self.route_hints = mode == "short"  # Steer toward route-only hazards at junctions (auto mode avoids them)
         self.fast_speed = float(os.environ.get("PILOT_SPEED", 1.0))  # Cruise speed on clear straight cells [m/s]
         self.safe_lane_offset = 0.48  # Lateral offset [m] placing robot in the middle of the ~0.98 m free lane
 
@@ -168,6 +178,9 @@ class Pilot:
         self.cell_penalty = torch.zeros(
             (num_envs, num_cells, num_cells), dtype=torch.float32, device=device
         )
+        # Cells the robot has stood in (kept across resets): a route hazard there is no news about where to go (the
+        # route through it also leads back to the start), so it earns no junction credit (_route_hint)
+        self.visited = torch.zeros((num_envs, num_cells, num_cells), dtype=torch.bool, device=device)
         # Corridor orientation axis for each cell: 0 = along X, 1 = along Y, -1 = unknown/corner
         self.cell_axis = torch.full(
             (num_envs, num_cells, num_cells), -1, dtype=torch.long, device=device
@@ -667,11 +680,43 @@ class Pilot:
             turn_pen = 0.08 if t in (1, 3) else (0.25 if t == 2 else 0.0)  # Small penalty for turning/reversing
             step_cost = self.cell_cost[idx, nb[:, 0], nb[:, 1]]  # Cost to step into neighbor cell
             cost = dist[idx, nb[:, 0], nb[:, 1]] + step_cost + turn_pen  # Total cost through this neighbor
+            if self.route_hints and t != 2:  # Not for going back: the route behind leads to the start
+                cost = cost - self._route_hint(idx, cell, d)  # Prefer a branch that shows it is a route
             ok = open_sides[idx, d] & (cost < best_cost - 1e-4)  # Must be open and strictly cheaper
             best = torch.where(ok, d, best)  # Update best direction
             best_cost = torch.where(ok, cost, best_cost)  # Update lowest cost
 
         return torch.where(best >= 0, best, (heading + 2) % 4)  # Turn back if all sides appear blocked
+
+    def _route_hint(self, idx: torch.Tensor, cell: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
+        """Cost credit (B,) for leaving ``cell`` in direction ``d``: the next cell (and, at half weight, the one beyond
+        it in a straight line) holds a hazard that only routes carry (ROUTE_HINT_BONUS) or loose boxes
+        (ROUTE_HINT_ROUGH). No credit for a step away from the goal (Manhattan), for a cell the robot fell or stalled
+        in (its penalties must keep it away) or one it has already stood in."""
+        n = self.num_cells
+        credit = torch.zeros(len(idx), dtype=torch.float32, device=self.device)
+        step = self.ap._dirs[d]  # (B, 2) unit steps
+        # A route runs both ways: only credit a step that does not lead away from the goal (level 9 seed 10 random
+        # ends: entering the long route halfway, the spike lane ahead was on its stretch back to the start, 12 s)
+        goal = torch.tensor(self.goal_cell, device=self.device)
+        toward = (cell + step - goal).abs().sum(dim=1) <= (cell - goal).abs().sum(dim=1)
+        if not bool(toward.any()):
+            return credit
+        on_route = torch.tensor(ROUTE_HAZARD_TYPES, device=self.device)
+        reach = toward.clone()  # Cell is in the maze, not walled off and the step heads toward the goal
+        for k, weight in ((1, 1.0), (2, 0.5)):  # Next cell, then the one beyond it
+            c = cell + k * step
+            reach = reach & ((c >= 0) & (c < n)).all(dim=1)
+            c = c.clamp(0, n - 1)
+            t = self.cell_type[idx, c[:, 0], c[:, 1]]  # Hazard type as sensed so far (unknown = no credit)
+            bonus = torch.where(torch.isin(t, on_route), ROUTE_HINT_BONUS, 0.0)
+            bonus = torch.where(t == CELL_ROUGH, ROUTE_HINT_ROUGH, bonus)
+            clean = (self.cell_deaths[idx, c[:, 0], c[:, 1]] == 0) & (self.cell_penalty[idx, c[:, 0], c[:, 1]] == 0)
+            new = ~self.visited[idx, c[:, 0], c[:, 1]]  # Level 9 seed 5: credit for a low ramp it had already
+            # crossed pulled the robot back toward the start after a dead end (8 s)
+            credit = credit + weight * torch.where(reach & clean & new, bonus, 0.0)
+            reach = reach & (self.ap.walls[idx, c[:, 0], c[:, 1], d] != 1)  # The cell beyond: not through a wall
+        return credit
 
     # ------------------------------------------------------------------
     # 3. Local Trajectory & Waypoint Control (Safe Lane & Slalom)
@@ -732,7 +777,11 @@ class Pilot:
                     u_aim = u_hold * travel_sign  # Stop where knees and heels both fit inside the gap
                     v_aim = v_entry  # Hold entry safe lane offset
                     speed = 0.42 if u_rel < -0.55 else 0.28  # Slow down near the gap so momentum does not carry past it
-                elif not aligned and u_rel < 0.95:  # Stage 2: strafe sideways across the 0.6 m gap
+                # Stage 2 only while the pelvis is in the gap: past it (pushed off the exit lane by a snag and the
+                # unstuck reflex at the exit) stage 2 walked it back along the exit bed into the spikes (level 9
+                # seed 3 random ends, forced short route); stage 3 instead walks on and over to the exit lane, away
+                # from that bed
+                elif not aligned and u_rel < 0.30:  # Stage 2: strafe sideways across the 0.6 m gap
                     u_aim = u_hold * travel_sign  # Hold the pelvis behind the gap centre (back off if it drifted on)
                     v_aim = v_exit  # Shift laterally across to the exit safe lane
                     speed = 0.0  # No forward walking: act() strafes with v_y while facing down the corridor
@@ -1093,6 +1142,7 @@ class Pilot:
         self._step += 1
         walls_now = self._walls_now
         self.last_cell = cell.clone()  # Record current cell for failure attribution if a reset occurs
+        self.visited[torch.arange(self.num_envs, device=self.device), cell[:, 0], cell[:, 1]] = True  # Been here
 
         # Use a tight turn radius (0.22 m) near spikes/trenches so the robot never cuts corners into hazards
         cur_type = self.cell_type[torch.arange(self.num_envs, device=self.device), cell[:, 0], cell[:, 1]]
@@ -1118,18 +1168,15 @@ class Pilot:
         # ice, right after entering the cell, so a turn on the spot brakes from the ice edge and rotates just inside it:
         # deciding 0.5 m from the centre rotated on the middle of the ice, and 5% of those turns fell (9 of 169 in the
         # maze; scripts/ice_turn_test.py --task G1-Ice-Corner-Test: 7-10% vs 0 of 1,000 braking from the cell border).
-        # Not next to a spike lane / slalom: stopping at the ice edge leaves the robot on the inside of the turn, up to
-        # 1 m from an outside lane, and lining up from there hit the slalom (level 9 seed 3, cell (6, 0))
+        # Also next to a spike lane / slalom: stopping at the ice edge leaves the robot on the inside of the turn, up to
+        # 1 m from an outside lane, which once hit level 9 seed 3's slalom (6, 1) while lining up; since lining up holds
+        # back (STAGE_HOLD_U) that is safe, while waiting to turn 0.5 m from the centre fell in 2 of 8 forced runs
         env_ar = torch.arange(self.num_envs, device=self.device)
         cell_walls = self.ap.walls[env_ar, cell[:, 0], cell[:, 1]]  # (N, 4) walls of the current cell
         back = (self.ap.heading + 2) % 4  # Side we came in through
         ahead_known = ((cell_walls != -1) | (torch.arange(4, device=self.device).unsqueeze(0) == back.unsqueeze(1))).all(dim=1)
         lateral = torch.abs(rel_centre[:, 0] * dir_vec[:, 1] - rel_centre[:, 1] * dir_vec[:, 0])  # Off-centreline [m]
-        nb = (cell.unsqueeze(1) + self.ap._dirs.unsqueeze(0)).clamp(0, self.num_cells - 1)  # (N, 4, 2) neighbour cells
-        nb_type = self.cell_type[env_ar.unsqueeze(1), nb[..., 0], nb[..., 1]]  # (N, 4) their hazard types
-        spikes_next = ((nb_type == CELL_SPIKE_LANE) | (nb_type == CELL_SPIKE_SLALOM)).any(dim=1)
-        ice_wait = (cur_type == CELL_ICE) & spikes_next  # Turn at the old place (0.5 m from the centre) there
-        early = ~cautious_cell & ~ice_wait & ahead_known & (u_along > -TURN_DECIDE_DIST) & (lateral < 0.45)
+        early = ~cautious_cell & ahead_known & (u_along > -TURN_DECIDE_DIST) & (lateral < 0.45)
         # Already inside a dead end (the three sides ahead are walls): decide now instead of walking to its centre
         side_ids = torch.arange(4, device=self.device).unsqueeze(0)
         ahead_walls = (cell_walls == 1) | (side_ids == back.unsqueeze(1))
@@ -1248,7 +1295,10 @@ class Pilot:
                 s = float(self.unstuck_dir[b].item())  # Turn/strafe sign (+1 or -1)
                 out_cmd[b, 0] = -0.25  # Walk backward at -0.25 m/s to free wedged feet
                 out_cmd[b, 1] = 0.20 * s  # Strafe sideways at 0.20 m/s
-                out_cmd[b, 2] = 0.75 * s  # Yaw at 0.75 rad/s
+                # Yaw at 0.75 rad/s, but not in a spike cell: there backing up after turning 40 deg swung the rear
+                # into the bed beside the lane (level 9 seed 3 random ends, snagged at the slalom's exit)
+                b_type = int(self.cell_type[b, cell[b, 0], cell[b, 1]].item())
+                out_cmd[b, 2] = 0.0 if b_type in (CELL_SPIKE_LANE, CELL_SPIKE_SLALOM) else 0.75 * s
                 self.ap.cmd[b] = out_cmd[b]  # Sync internal rate-limiter state
                 continue
 
