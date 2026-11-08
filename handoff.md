@@ -3,18 +3,20 @@
 Use this file to pick the work up in a new session. The full write-up of methods and results is in
 [develop.md](develop.md); this file covers the current state, how to work, and what's next.
 
-## 1. Where things stand (2026-11-05)
+## 1. Where things stand (2026-11-08)
 
 | Part | State |
 |---|---|
 | Walking policy | `logs/rsl_rl/g1_hazard_pro/2026-10-31_17-46-45_skill_curr1500/model_8497.pt`. Trained with the fixed terrain curriculum (`terrain_levels_skill`). Climbs ramps up to about 0.28 m and crosses trenches. `logs/` is git-ignored, so a copy with its `params/` is committed as **`pretrained/hazard_pro/model_8497.pt`** (2026-11-07, byte-identical). |
-| Pilot | [pilot.py](pilot.py), 1,348 lines. Includes the dead-end fix, lidar wall mapping, turn-back on the spot, stuck-check guard and the fixes found in testing (develop.md §4.8), plus (2026-11-02) trench crossing at 0.9 m/s and the stall-blame rule (section 5, item 7), and (2026-11-03) steep ramps climbed at 0.9 m/s after a 1 m run-up (section 3, "Ramp test") and ice turns decided at the ice edge (section 3, "Ice turn test"). The 2026-11-03 spike-entry and rough-floor turn experiments were reverted (section 3, "Spike-lane corners"; section 4). |
+| Pilot | [pilot.py](pilot.py), 1,539 lines. Includes the dead-end fix, lidar wall mapping, turn-back on the spot, stuck-check guard and the fixes found in testing (develop.md §4.8), plus (2026-11-02) trench crossing at 0.9 m/s and the stall-blame rule (section 5, item 7), and (2026-11-03) steep ramps climbed at 0.9 m/s after a 1 m run-up (section 3, "Ramp test") and ice turns decided at the ice edge (section 3, "Ice turn test"). The 2026-11-03 spike-entry and rough-floor turn experiments were reverted (section 3, "Spike-lane corners"; section 4). |
 | Training setup | `G1-Hazard-Challenge` (real ice, pilot-like commands, sideways reward, harder hazards) plus the sideways and rough-floor tests, built 2026-11-03. **Tried 2026-11-04/05 and dropped: `model_8497` stays the policy.** Two runs (from `model_5600`, 3,000 iterations; from `model_8497`, 1,500) gave checkpoints much better on trenches and ramps, but each had a new weakness: long ice turns (late checkpoints), weak sideways steps (`model_7500`: 1152.5 s, 6 resets on the benchmark) or forward drift at slow / backward commands (`model_9500`: 1012.4 / 901.8 s, 5 / 3 resets, every level 9 slalom hit; otherwise 4–5% faster). See section 3, "Policy training setup". Challenge day: Saturday 2026-11-14. |
 | Pilot changes (2026-11-04) | In the working tree, **not committed**: rough-floor speed 0.9 (`ROUGH_SPEED`), turn-backs moved off rough floor (`PIVOT_ROUGH_EXIT`), rough corners into ice at rough speed (`ICE_SLOW_DIST`), the old 0.68 before trenches, and the stuck guard using measured velocity. Benchmark **638.7 s and 641.0 s, 0 falls** (bar 685 / 685); residual risk at L9 seed 2's trench (section 3, "Rough corners into ice, trench approach, stuck guard"). Plus (2026-11-05) the re-decide when a late turn ends in the next cell (`lost`, L9 seed 50): seed 50 crash gone in 3 of 3 runs, benchmark 645.8 s / 0 falls and 728.4 s / 1 trench fall not caused by it (section 3, "Late turn that ends in the next cell"). |
-| Pilot changes (2026-11-07, in the working tree) | Ice turns always at the ice edge, slalom stage 2 only inside the gap, unstuck reflex without turning in spike cells. Slalom sweep over 8 mazes' entries (0 spike hits in 7 crossings); benchmark 645.8 / 644.6 / 655.6 s, 0 falls (section 3, "Slalom sweep, ice turns at the edge, ..."). |
-| Route hints (2026-11-08, in the working tree) | At a junction, prefer a branch whose next cell shows a hazard only routes carry (or loose boxes): exploring −8% on six extra mazes, no decision changed on 7 of the 8 benchmark mazes (section 3, "Route hints at junctions"). |
-| Tests | `uv run pytest tests`: **109 pass** (no simulator needed). |
-| Git | Branch `side-test`. Everything through the 2026-11-03 ramp and ice-turn work is committed (`git log` for the latest commit; `tools/` and `logs/` are git-ignored, so the checkpoint is not in git). The training setup is not committed yet. Ask before committing. |
+| Pilot changes (2026-11-07, committed `95c9dc8`) | Ice turns always at the ice edge, slalom stage 2 only inside the gap, unstuck reflex without turning in spike cells. Slalom sweep over 8 mazes' entries (0 spike hits in 7 crossings); benchmark 645.8 / 644.6 / 655.6 s, 0 falls (section 3, "Slalom sweep, ice turns at the edge, ..."). |
+| Route hints (2026-11-08, committed `95c9dc8`) | At a junction, prefer a branch whose next cell shows a hazard only routes carry (or loose boxes): exploring −8% on six extra mazes, no decision changed on 7 of the 8 benchmark mazes (section 3, "Route hints at junctions"). |
+| Slalom sweep 2 + ramp classifier (2026-11-08, in the working tree) | 36 more level 9 mazes on the forced short route: **31 slalom crossings, 0 spike hits** (38 / 38 with the first sweep). Of the 6 falls elsewhere, 2 were steep ramps taken for a slalom and 1 a turn on the spot that rotated the long way inside a spike lane; fixed (ramp evidence per half, smooth-slope test, rotation sign re-chosen). Offline audit over the 44 sweep runs: no spike cell ever called a ramp, ramps misread as spike cells 69 s → 0.1 s. Benchmark 648.8 / 647.7 s (without the smooth-slope test) and 765.9 / 649.8 s (final); its falls and resets (L9 seed 2's trench, sideways staging on rough floor, L7 seed 2's 10 s stuck check) were traced to known problems, none to these changes (section 3, "Slalom sweep 2: ramps taken for spike cells, turn direction"). |
+| Stuck guard walks on through (2026-11-08, in the working tree) | On the way back from a dead end toward the last 10 s check's spot (L7 seed 2's two resets), `_stuck_guard` now keeps walking through the spot at the commanded speed when that is predicted to end farther than stopping / backing, only facing the travel direction, on plain / rough floor and never into a wall or hazard cell. Benchmark 647.8 / 644.6 s, 0 falls or resets (first version 651.3 / 769.0 s; the 3 falls were L9 seed 2's trench and ice turns, guard idle). 16 L7 seed 2 runs, 0 resets, but the deep snag did not recur, so the new branch is checked by tests only (section 3, "Stuck guard: walk on through"). |
+| Tests | `uv run pytest tests`: **118 pass** (no simulator needed). |
+| Git | Branch `side-test`. Everything through the route hints is committed (`git log` for the latest commit; `tools/` and `logs/` are git-ignored, so the checkpoint is not in git). Ask before committing. |
 | Submission | Upload `model_8497.pt` as `policy.pt` plus `pilot.py`. `PILOT_MODE` already defaults to `short` (the runner sets no env vars). |
 
 ### Latest benchmark (two runs each; simulator runs vary)
@@ -56,7 +58,7 @@ These numbers are the bar for any change: same 8 mazes, at least 2 runs each, no
 | | `act()` decide block | Re-decides when the pilot needs a decision, on arrival (including the early decision before corners), on a new wall, a new hazard, a route-cost rise (`route_surprise`), or when the robot is in a dead end. **Never decides inside the goal cell.** |
 | Control | `_compute_waypoint_and_speed` | Waypoint and speed limit: corner curves (`_pursuit_point`), spike-lane safe lane and pre-alignment (with sideways staging), slalom stages, cone avoidance. |
 | | `_pivot_command` | Turn-back: brake → step away from walls → rotate on the spot. Used for turn-backs, late 90° turns, and every turn on ice. |
-| | `_stuck_guard` | Moves off the previous 10 s check position just before the next check. |
+| | `_stuck_guard` | Moves off the previous 10 s check position just before the next check: stops, steps away, or walks on through it, whichever is predicted to end farther. |
 | | `act()` control loop | Priority: unstuck reflex > stuck guard > pivot > slalom strafe > normal tracking. |
 | Debug | `get_debug_snapshot` | Read by the viewer HUD. |
 
@@ -715,6 +717,160 @@ walking pace (0–0.25 m/s while turning), and, after that reset, sideways stagi
 stumbled into the wall; run 2 of that maze was clean (85.2 s). L9 seed 2 run 2 (97.7 s) had a snag and the unstuck
 reflex on the same route.
 
+### Slalom sweep 2: ramps taken for spike cells, turn direction (2026-11-08, in the working tree)
+
+**Sweep.** 36 level 9 mazes not run before, forced onto the short route (`tools/force_route.py`, one run each),
+chosen from `logs/slalom_scan_L9.txt` to cover every way into a slalom: straight (rough, ice, after a trench / steep
+ramp / spike lane), corners from rough or ice with the entry lane on the outside or the inside of the turn, left and
+right. Summary per run: scratchpad `sweep_summary.py` (time in the slalom, sideways-step time, nearest lidar, exit).
+**31 slalom crossings, 0 spike hits** (9.6–13.5 s each, nearest 0.30–0.37 m); with the first sweep 38 / 38. Five runs
+never reached the slalom: `force_route.py` forces only the first step and the pilot turned back after one cell in 3
+(seed 1 / 13 / 31 random ends), and 2 lost the forced start in a reset. Six falls elsewhere:
+
+| Run | Cell | Cause |
+|---|---|---|
+| seed 11, seed 16 | trenches (3, 7), (4, 0) | the policy's trench risk (section 3, "Slalom sweep, ...": ~4% per crossing) |
+| seed 20 | ice (3, 8) after the slalom exit | **the steep ramp ahead (4, 8) taken for a spike lane, then a slalom**: lined up sideways on the ice and fell |
+| seed 47 random ends | steep ramp (7, 6) | **the ramp taken for a slalom and kept as one while on it**: climbed at slalom speed (0.28–0.42), stalled, the unstuck reflex backed it off and it fell |
+| seed 15 random ends | spike lane (7, 1) | **turn on the spot rotated the long way inside the lane** (below) |
+| seed 44 random ends | rough (4, 1) after the slalom exit | snagged while lining up for the spike lane (4, 2); the unstuck reflex (turning, rough cell) backed into the wall |
+
+**Why ramps looked like spike cells.** `tools/classify_replay.py` (git-ignored, reads the real map) rebuilds the maze
+mesh offline, recreates the 33 × 33 scan at every traced pose and replays `_classify_cell_from_scan`; it reproduced
+both runs to within 0.2 s. Seed 20: yawed 0.6 rad on the ice, the scan caught only one corner of the ramp cell (the
+slope's foot, u −0.80…−0.45 on +v): elevated hits on one side → spike lane. Once straight, 4 points of the foot on −v
+of the **same half** passed 0.11 m, and the slalom upgrade fired because the earlier safe offset had the other sign
+(both halves get the same offset from a view of one half). Seed 47 the same from rough, and the ramp test never
+overwrote a slalom. The generator rules out both: a spike bed never reaches past the corridor's middle (reach
+−0.1…0.0 m) and the two slalom beds lie in opposite halves, even if the axis is wrong.
+
+**Fixes (`_classify_cell_from_scan`).**
+1. `elev_sides` (per cell, kept): sides with ≥ 2 elevated hits seen so far in each half (reset when the cell's axis
+   changes). Both sides in one half → ramp, and that overrules an earlier slalom.
+2. The spike-lane → slalom upgrade needs the opposite side seen in the **other** half (from `elev_sides`), not an
+   opposite safe-offset sign.
+3. **Smooth slope → ramp from the first view** (`_smooth_slope`, `SLOPE_FIT_RMS = 0.002`, `SLOPE_MIN_POINTS = 8`,
+   `SLOPE_RANGE`): fit z = a + b |u| + c v to the in-cell hits on slopes / cones (0.02 < z < 0.42, |u| > 0.25). With
+   fixes 1–2 only, seed 20 still fell in 2 of 2 runs: no second view came, the ramp stayed a "spike lane" for 2.6 s
+   while the robot stepped sideways on the ice (it slid the other way), then it spun out on the run-up turning
+   0.65 rad/s at 0.65 m/s. `tools/plane_stats.py` over 44 runs (views with ≥ 8 such hits): 14,140 ramp views fit to
+   0.000 m (an exact plane); 25,392 spike lane / slalom views none below 0.0065 m, none below 0.0147 m with a
+   ramp-like slope and tilt.
+
+**Turn direction (`act()`, decide block).** Seed 15 random ends: turning on the spot toward (8, 0) in the rough corner
+(7, 0), right after the spike lane (7, 1), the loose boxes threw the robot 0.9 m back into the lane; the re-decide
+there changed the pivot's goal to south, 40° clockwise, but `pivot_dir` kept the counter-clockwise sign chosen for the
+old goal and it swept 330° inside the lane into the spikes. A changed goal heading now resets `pivot_dir` (the
+shortest way is picked again).
+
+Tests: `test_ramp_foot_seen_one_side_at_a_time_is_a_ramp_not_a_slalom`, `test_ramp_slope_seen_from_one_side_is_a_ramp_at_once`,
+`test_false_slalom_is_corrected_by_a_view_of_the_ramp`, `test_pivot_retargeted_by_a_redecide_turns_the_short_way`
+(fail on the old pilot), `test_slalom_seen_one_half_at_a_time_still_becomes_a_slalom`,
+`test_spike_cones_are_never_a_smooth_slope` (guards). `test_option_b.py` reuses one cell for every hazard type and now
+clears `elev_sides` with `cell_type` between cases.
+
+**Offline audit** (`tools/classify_audit.py`: old and new classifier on the same recreated scans along all 44 sweep
+runs, the robot's cell and its open neighbours, every 2nd step):
+
+| True type | Cells | Final type right, old → new | Time taken for a spike lane / slalom, old → new |
+|---|---|---|---|
+| Spike lane | 105 | 105 → 105 | identical (4.6 s plain / rough at first sight, both) |
+| Slalom | 38 | 38 → 38 | identical (159 s "spike lane" before the second bed is seen, both) |
+| Steep ramp | 77 | 54 → **77** | 44.0 s → **0.1 s** |
+| Low ramp | 38 | 15 → **32** | 24.9 s → **0** |
+
+No spike cell was ever called a ramp. The old classifier also relabelled many ramps as spike lanes **after** passing
+them (a backward view of one side), so a revisit after a reset would have climbed them at spike-lane speed (seed
+47's stall). Still open: 6 low ramps end as rough (their foot is below 0.11 m; 45 s in both versions).
+
+**Forced reruns:**
+
+| Maze | Before | Fixes 1–2 + turn | + smooth slope |
+|---|---|---|---|
+| L9 seed 20 | 199.6 s, 1 fall | 200.8 / 199.2 s, 1 fall each | **67.4 / 67.6 s, 0** |
+| L9 seed 47, random ends | 236.9 s, 1 fall | 112.7 / 113.2 s, 0 | 112.2 / 115.5 s, 0 |
+| L9 seed 15, random ends | 193.2 s, spike hit | 109.3 / 104.2 s, 0 (the throw-back did not recur) | — |
+
+**Benchmark (normal routes):**
+
+| Maze | Fixes 1–2 + turn, run 1 | run 2 | Final (+ smooth slope), run 1 | run 2 | Bar |
+|---|---|---|---|---|---|
+| L7 seed 1 | 59.6 | 60.0 | 59.4 | 59.4 | 59.5 / 59.2 |
+| L7 seed 2 | 88.5 (stuck-check reset) | 86.1 | 85.9 | 90.8 (stuck-check reset) | 86.5 / 86.7 |
+| L7 seed 3 | 78.8 | 78.5 | 79.2 | 79.4 | 78.8 / 78.6 |
+| L7 seed 4, random ends | 47.3 | 48.0 | 47.5 | 47.4 | 45.6 / 46.6 |
+| L9 seed 1 | 116.0 | 116.1 | 115.9 | 116.0 | 115.9 / 116.0 |
+| L9 seed 2 | 90.2 | 91.0 | 214.1 (2 falls, below) | 89.6 | 86.7 / 87.1 |
+| L9 seed 3 | 88.0 | 87.0 | 85.0 | 87.1 | 85.7 / 83.6 |
+| L9 seed 5, random ends | 80.4 | 81.0 | 78.9 | 80.1 | 80.0 / 83.2 |
+| **Total** | **648.8 s, 1 reset** | **647.7 s, 0** | **765.9 s, 2 falls** | **649.8 s, 1 reset** | 638.7 / 641.0 s |
+
+None of the falls or resets came from these changes (each traced): L9 seed 2 run 1 fell at the 0.20 m trench (4, 0)
+after the rough cell (3, 0) (classified correctly, crossed at 0.9 m/s; the maze's known trench risk), then, on the
+long route, stumbled while stepping sideways on the rough cell (4, 6) to line up for the real spike lane (4, 5) (the
+rough-floor staging problem, as L9 seed 3 in "Route hints"). Both L7 seed 2 resets are the stuck check below. The
+other runs are within ±1.5 s of each other and of the bar; L9 seed 2's ramps are now steep ramps throughout.
+
+**L7 seed 2's two resets: the 10 s stuck check, not a fall and not from these changes.** Every version walks into the
+dead end east of (4, 0) at t ≈ 10 s and passes the t = 10 s spot again at t ≈ 20 s (0.37–0.9 m clear in 5 earlier
+runs). In 2 of the last 4 runs a snag on the rough cell (4, 0) slowed it (all 4 re-entered (4, 0) at 17.0–17.1 s; the
+classifier changes never touch rough cells); the stuck guard backed it away from the spot (it always steps away on
+the same side), momentum carried it to 0.14 m and it ended 0.21 m from the spot (limit 0.25 m). Fixed in the next
+section (walking on through at the commanded speed; a fixed 0.5 m/s would not have been enough).
+
+### Stuck guard: walk on through the last check's spot (2026-11-08, in the working tree)
+
+**Problem** (the two L7 seed 2 resets above; traces `v5_bench` run 1 and `v6_bench` run 2 of the slalom sweep 2
+session). The guard's command ramps from the 0.9 m/s rough-floor speed toward −0.25 m/s at 2 m/s², but the robot keeps
+its speed for about 0.6 s after the guard wakes (run 1: 0.38–0.43 m/s until 19.1 s), then backs at only 0.12–0.15 m/s.
+Run 1: 0.36 m short of the spot at 0.38 m/s → carried to 0.13 m, ended 0.22 m. Run 2: snagged 0.18 m short (0 m/s),
+backed off only 0.07 m, ended 0.248 m. The "stop" branch (beyond 0.35 m) has the same flaw. Walking on at a fixed
+0.5 m/s would also have failed run 1 (~0.24 m past the spot); at the 0.9 m/s already commanded it ends ~0.5 m past.
+
+**Rule (`_stuck_guard`).** The old command (stop beyond 0.35 m, else step away on the robot's side) stays the default.
+A "through" command replaces it when its predicted distance from the spot at check time is larger: along the travel
+axis at the speed already commanded (at least `STUCK_GUARD_THROUGH` = 0.5 m/s), scaled (not clipped) into the trained
+ranges so it stays on the axis, no yaw. Prediction: the measured velocity for `STUCK_GUARD_LAG` = 0.6 s, then the
+command times `STUCK_GUARD_GAIN` (0.83 forward, 0.55 backward, 0.5 sideways). It gives 0.25 / 0.26 m for the old rule
+in the two reset traces (real: 0.22 / 0.248 m) and 0.52 / 0.54 m for walking on. Through only when (a) facing within
+45° of the travel direction (walking, not a sideways step), (b) in a plain / rough cell, and (c) either stopping 0.45 m
+short of the cell border ahead or with the side ahead known open onto a plain / rough cell (never into a wall, or into
+a trench / ramp / spike / ice cell without the pilot's lining up and speed rules). Otherwise the old rule.
+
+Tests: `test_stuck_guard_walks_on_through_the_last_check_position` (0.33 m short at 0.36 m/s, and 0.40 m short where
+the old rule stopped; fails on the old pilot), `test_stuck_guard_does_not_walk_through_into_a_hazard` (trench ahead:
+steps back), `test_stuck_guard_does_not_step_sideways_through` (mid-turn: the old rule's stop; fails without the 45°
+limit). The two older guard tests pass unchanged.
+
+**Benchmark** (runs 1–2: first version, without the 45° limit; runs 3–4: final):
+
+| Maze | Run 1 | Run 2 | Final run 3 | Final run 4 | Before (sweep 2 final) |
+|---|---|---|---|---|---|
+| L7 seed 1 | 59.5 | 60.2 | 60.1 | 59.3 | 59.4 / 59.4 |
+| L7 seed 2 | 85.7 | 85.5 | 85.3 | 86.7 | 85.9 / 90.8 (stuck-check reset) |
+| L7 seed 3 | 78.4 | 78.5 | 79.6 | 78.7 | 79.2 / 79.4 |
+| L7 seed 4, random ends | 47.0 | 47.0 | 46.8 | 47.3 | 47.5 / 47.4 |
+| L9 seed 1 | 115.6 | 115.8 | 116.3 | 116.2 | 115.9 / 116.0 |
+| L9 seed 2 | 90.0 | 213.9 (3 falls, below) | 89.4 | 89.9 | 214.1 (2 falls) / 89.6 |
+| L9 seed 3 | 86.7 | 88.5 | 86.8 | 86.6 | 85.0 / 87.1 |
+| L9 seed 5, random ends | 88.4 | 79.6 | 83.5 | 79.9 | 78.9 / 80.1 |
+| **Total** | **651.3 s, 0** | **769.0 s, 3 falls** | **647.8 s, 0** | **644.6 s, 0** | 765.9 s, 2 falls / 649.8 s, 1 reset |
+
+The guard woke in only 2 of these 32 runs, both L9 seed 5 random ends at t = 48.5 s, mid-turn in the rough corner
+(5, 4), 0.63 / 1.11 m from the spot. In run 2 the first version chose "through", which in that pose is a 0.35 m/s
+sideways step on loose boxes (it ended 0.64 m from the spot, no harm), hence the 45° limit. In run 4 the final version
+stopped, as the old rule did (0.55 m). In every other run the guard stayed idle, so those runs behave exactly like the
+old pilot: run 2's L9 seed 2 falls were the trench (4, 0) at 15.8 s and two turns on the spot on ice ((4, 4) at 110 s,
+(1, 1) at 124 s), and L9 seed 5 run 1 lost its time to dead-end exploration (17.1 s vs 8.7 s).
+
+**L7 seed 2:** 16 runs with the new guard (10 first version, 6 final, the benchmark ones included), 85.2–88.4 s,
+**0 resets**. But the deep snag never recurred: the robot slowed to only 0.38–0.70 m/s in (4, 0) and passed the
+t = 10 s spot 0.87–1.38 m clear, so the guard never woke there (the two reset runs had 0.00–0.05 m/s). The new branch
+is checked by the tests and the model check above, not yet in a closed-loop run. Traces and `guard_report.py` (lists
+every guard episode per 10 s check, `uv run python guard_report.py <trace.csv> ...`):
+`C:\Users\user\AppData\Local\Temp\claude\746074aed36627eb\68de3be3-5f37-4a3b-9bfe-a4792e8b4966\scratchpad\guard\`
+(`v2\` = final code).
+
 ## 4. Gotchas learned the hard way
 
 - **Runs vary.** The same seed can differ by 50+ s. Never judge a change from one run.
@@ -817,6 +973,14 @@ reflex on the same route.
    t ≈ 10 s, about 25 s lost each).
 8. **The final level** (10 × 10, slalom on both routes, random ends) can't be run locally until its task folder is
    released. Practise with `--level 9 --random-ends` on several seeds.
+9. **Stuck guard on the way back from a dead end** (`_stuck_guard`): it always stepped away from the last check's spot
+   on the side the robot was on, even when the robot was walking toward and through that spot; backing at −0.25 m/s
+   against the momentum left L7 seed 2 0.21 m from the spot (reset at t = 20 s, section 3, "Slalom sweep 2").
+   *Done 2026-11-08 (in the working tree):* the guard walks on through at the commanded speed (≥ 0.5 m/s) when that is
+   predicted to end farther (a fixed 0.5 m/s would not have cleared that run), facing the travel direction, on plain /
+   rough floor, never into a wall or hazard cell; benchmark 647.8 / 644.6 s, 0 falls (section 3, "Stuck guard: walk on
+   through"). **Open:** not yet seen in a closed-loop run (the deep snag did not recur in 16 L7 seed 2 runs); if a
+   stuck-check reset happens again, trace it and check what the guard chose.
 
 ## 6. Before submitting
 

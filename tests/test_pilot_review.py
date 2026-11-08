@@ -235,6 +235,106 @@ def test_steep_ramp_is_not_downgraded_by_a_later_partial_view(monkeypatch):
     )
 
 
+def test_ramp_foot_seen_one_side_at_a_time_is_a_ramp_not_a_slalom(monkeypatch):
+    """Level 9 seed 20: from an ice cell, yawed 0.6 rad, the scan caught only a corner of the steep ramp ahead (the
+    slope's foot on +v) and called it a spike lane; once straight, a few points on -v of the same half passed 0.11 m
+    and the spike-lane upgrade made it a slalom (opposite side to before), so the robot lined up for a gap on the ice
+    and fell. Spike beds never pass the corridor's middle and slalom beds lie in opposite halves: both sides elevated
+    in one half (over scans) is a ramp."""
+    p = _pilot(monkeypatch)
+    xy = _grid(4.0, 0.0)
+    z = _ramp(xy, 2, 0, height=0.28)
+    u, v = _uv(xy, 2, 0)
+    # Two rows each: too narrow for the smooth-slope fit, so this checks the both-sides-in-one-half rule alone
+    corner = (u > -0.65) & (u < -0.45) & (v > 0.05) & (v < 0.85)  # Yawed: only this corner of the cell in view
+    p._classify_cell_from_scan(0, 2, 0, xy[corner], z[corner], 0)
+    assert int(p.cell_type[0, 2, 0]) == CELL_SPIKE_LANE, "setup: one side of the slope's foot should look like a bed"
+    other = (u > -0.75) & (u < -0.55) & (v < -0.05) & (v > -0.85)  # Then the foot on the other side, same half
+    p._classify_cell_from_scan(0, 2, 0, xy[other], z[other], 0)
+    kind = int(p.cell_type[0, 2, 0])
+    assert kind in (CELL_STEEP_RAMP, CELL_LOW_RAMP), f"ramp seen in pieces classified as type {kind}, not a ramp"
+    assert float(p.safe_offset[0, 2, 0].abs().max()) == 0.0, "ramp keeps a spike-lane offset: robot would line up"
+
+
+def test_ramp_slope_seen_from_one_side_is_a_ramp_at_once(monkeypatch):
+    """Level 9 seed 20 again, with the fix above: no second view came, so the corner view kept the ramp a "spike
+    lane" for 2.6 s while the robot lined up sideways on the ice, then it spun out on the run-up. A ramp's slope is a
+    plane (height linear along the corridor), cones are not: a smooth slope is a ramp from the first view."""
+    p = _pilot(monkeypatch)
+    xy = _grid(4.0, 0.0)
+    z = _ramp(xy, 2, 0, height=0.28)
+    u, v = _uv(xy, 2, 0)
+    corner = (u > -0.8) & (u < -0.45) & (v > 0.3) & (v < 0.8)
+    p._classify_cell_from_scan(0, 2, 0, xy[corner], z[corner], 0)
+    kind = int(p.cell_type[0, 2, 0])
+    assert kind in (CELL_STEEP_RAMP, CELL_LOW_RAMP), f"one-sided view of a ramp's slope classified as type {kind}"
+
+
+def _cones(xy, ci, cj, side, u0, u1, axis=0):
+    """Spike bed as the generator builds it: cones (radius 0.0675 m, pitch 0.15 m, 0.25-0.35 m tall) from the wall on
+    ``side`` to the corridor's middle."""
+    u, v = _uv(xy, ci, cj, axis)
+    z = torch.zeros_like(u)
+    rad, k = 0.45 * 0.15, 0
+    lo, hi = sorted((side * HW, 0.0))
+    cu = u0 + rad
+    while cu <= u1 - rad + 1e-6:
+        cv = lo + rad
+        while cv <= hi - rad + 1e-6:
+            h = 0.25 + 0.1 * ((k * 7919) % 101) / 100.0  # Fixed pseudo-random heights
+            r = torch.sqrt((u - cu) ** 2 + (v - cv) ** 2)
+            z = torch.maximum(z, torch.where(r < rad, h * (1.0 - r / rad), torch.zeros_like(z)))
+            cv, k = cv + 0.15, k + 1
+        cu += 0.15
+    return z
+
+
+def test_spike_cones_are_never_a_smooth_slope(monkeypatch):
+    """The smooth-slope rule must never turn a spike cell into a ramp (the robot would walk the centreline): cone beds
+    seen whole or in part, from either side, stay spike lanes / slaloms."""
+    for x0 in (2.2, 2.6, 3.0, 3.4, 4.0, 4.6):  # Approaching through the previous cell, then inside
+        for y0 in (-0.5, 0.0, 0.5):
+            p = _pilot(monkeypatch)
+            xy = _grid(x0, y0)
+            for d in (1, 3):
+                _close_wall(p, 2, 0, d)
+            p._classify_cell_from_scan(0, 2, 0, xy, _cones(xy, 2, 0, +1, -0.7, 0.7), 0)
+            assert int(p.cell_type[0, 2, 0]) in (0, CELL_SPIKE_LANE), f"spike lane seen from ({x0}, {y0}) as a ramp"
+            p = _pilot(monkeypatch)
+            z = _cones(xy, 2, 0, +1, -0.9, -0.3) + _cones(xy, 2, 0, -1, 0.3, 0.9)
+            p._classify_cell_from_scan(0, 2, 0, xy, z, 0)
+            kind = int(p.cell_type[0, 2, 0])
+            assert kind in (0, CELL_SPIKE_LANE, CELL_SPIKE_SLALOM), f"slalom seen from ({x0}, {y0}) as type {kind}"
+
+
+def test_false_slalom_is_corrected_by_a_view_of_the_ramp(monkeypatch):
+    """Level 9 seed 47 random ends: a steep ramp taken for a slalom stayed one even with the robot on it (the ramp
+    test never overwrote a slalom), so it climbed at slalom speed, stalled and fell backing off. Elevated hits on
+    both sides of one half are impossible for a slalom, whatever the axis: they overrule it."""
+    p = _pilot(monkeypatch)
+    p._set_cell_hazard(0, 2, 0, CELL_SPIKE_SLALOM)
+    p.safe_offset[0, 2, 0, 0], p.safe_offset[0, 2, 0, 1] = -0.48, 0.48
+    xy = _grid(4.0, 0.0)  # Standing on it
+    p._classify_cell_from_scan(0, 2, 0, xy, _ramp(xy, 2, 0, height=0.28), 0)
+    assert int(p.cell_type[0, 2, 0]) == CELL_STEEP_RAMP, f"false slalom kept: type {int(p.cell_type[0, 2, 0])}"
+
+
+def test_slalom_seen_one_half_at_a_time_still_becomes_a_slalom(monkeypatch):
+    """The slalom upgrade now needs the opposite side in the other half: entry bed (u < 0, +v) in one view and
+    exit bed (u > 0, -v) in a later one must still give a slalom with the right lane per half."""
+    p = _pilot(monkeypatch)
+    xy = _grid(4.0, 0.0)
+    z = _bed(xy, 2, 0, side=+1, u0=-0.9, u1=-0.3) + _bed(xy, 2, 0, side=-1, u0=0.3, u1=0.9)
+    u, _ = _uv(xy, 2, 0)
+    entry, exit_half = u < -0.12, u > 0.12
+    p._classify_cell_from_scan(0, 2, 0, xy[entry], z[entry], 0)
+    assert int(p.cell_type[0, 2, 0]) == CELL_SPIKE_LANE, "setup: the entry bed alone looks like a spike lane"
+    p._classify_cell_from_scan(0, 2, 0, xy[exit_half], z[exit_half], 0)
+    assert int(p.cell_type[0, 2, 0]) == CELL_SPIKE_SLALOM, f"not upgraded: type {int(p.cell_type[0, 2, 0])}"
+    lanes = (float(p.safe_offset[0, 2, 0, 0]), float(p.safe_offset[0, 2, 0, 1]))
+    assert abs(lanes[0] + 0.48) < 1e-4 and abs(lanes[1] - 0.48) < 1e-4, f"lanes per half {lanes}, not (-0.48, +0.48)"
+
+
 # ----------------------------------------------------------------------------- review #3
 def test_slalom_does_not_advance_into_second_bed_before_crossing(monkeypatch):
     """Review #3: past u = +0.25 the slalom code jumps to stage 3 even if the lane change is not finished.
@@ -592,6 +692,50 @@ def test_stuck_guard_sees_a_snagged_robot(monkeypatch):
     assert guard is not None and math.hypot(guard[0], guard[1]) > 0.2, "guard idle although the robot is not moving"
 
 
+def _back_from_dead_end(monkeypatch, ahead: int) -> Pilot:
+    """Level 7 seed 2: the t = 10 s check saw the robot at x = 7.85 in the rough cell (4, 0) on its way into the dead
+    end east of it; at t = 18.5 s it walks back west toward (3, 0), whose type is ``ahead``."""
+    p = _pilot(monkeypatch)
+    _set_plan(p, origin=(4, 0), target=(3, 0), heading=2)
+    p.cell_type[0, 4, 0] = CELL_ROUGH
+    p.cell_type[0, 3, 0] = ahead
+    p.ap.walls[0, 4, 0, 2] = p.ap.walls[0, 3, 0, 0] = 0  # (4, 0) -> (3, 0) is open (walked through on the way in)
+    p.check_pos[0] = torch.tensor([7.85, 0.0])  # Position at the t = 10 s check
+    p.ap.cmd[0] = torch.tensor([0.9, 0.0, 0.0])  # Rough-floor speed, slowed by a snag
+    p.sim_time = 18.5  # 1.5 s before the t = 20 s check
+    return p
+
+
+def test_stuck_guard_walks_on_through_the_last_check_position(monkeypatch):
+    """Level 7 seed 2 (reset at t = 20 s in 2 of 4 runs): walking back from a dead end, 0.33 m short of where the
+    t = 10 s check saw it and still walking toward that spot at 0.36 m/s, the guard backed away at -0.25 m/s; the
+    robot walked on for 0.6 s, came to 0.14 m and ended 0.21 m from the spot. It must walk on through the spot
+    (forward, along the corridor, without turning); 0.40 m short, where the old guard stopped, too."""
+    p = _back_from_dead_end(monkeypatch, CELL_PLAIN)
+    for x in (8.18, 8.25):
+        guard = p._stuck_guard(0, torch.tensor([x, 0.0]), math.pi, torch.tensor([0.36, 0.0, 0.0]))
+        assert guard is not None, f"x = {x}: guard idle"
+        v, vy, w = guard
+        assert v > 0.45 and abs(vy) < 1e-3 and w == 0.0, f"x = {x}: command ({v:+.2f}, {vy:+.2f}, {w:+.2f}) not through"
+
+
+def test_stuck_guard_does_not_walk_through_into_a_hazard(monkeypatch):
+    """The same, but the cell ahead is a trench (crossed only at TRENCH_SPEED after lining up): the guard must not
+    walk the robot into it and keeps stepping back from the spot."""
+    p = _back_from_dead_end(monkeypatch, CELL_TRENCH)
+    guard = p._stuck_guard(0, torch.tensor([8.18, 0.0]), math.pi, torch.tensor([0.36, 0.0, 0.0]))
+    assert guard is not None and guard[0] < -0.2 and guard[2] == 0.0, f"command {guard} does not step back"
+
+
+def test_stuck_guard_does_not_step_sideways_through(monkeypatch):
+    """Mid-turn (level 9 seed 5 random ends, rough corner (5, 4)): still facing north and walking north at 0.4 m/s
+    toward the last check's spot, the new travel direction west. Walking on "through" would be a sideways step on
+    loose boxes (predicted to end farther than stopping); keep the old rule (here: stop, 0.52 m from the spot)."""
+    p = _back_from_dead_end(monkeypatch, CELL_PLAIN)
+    guard = p._stuck_guard(0, torch.tensor([7.7, -0.5]), math.pi / 2, torch.tensor([0.4, 0.0, 0.0]))
+    assert guard == (0.0, 0.0, 0.0), f"command {guard} is not the old rule's stop"
+
+
 def test_no_new_target_inside_goal_cell(monkeypatch):
     """GOAL needs the robot within 0.6 m of the goal cell's centre. Entering the goal cell (6, 6) from the south,
     the pilot must keep walking to its centre, not pick a next cell and turn back out (ping-pong at the goal)."""
@@ -629,6 +773,24 @@ def test_late_replan_turn_rotates_on_the_spot(monkeypatch):
     p.act(_obs((4.3, 0.0), flat, t=1.02))
     assert int(p.ap.heading[0]) == 1, "did not replan north"
     assert int(p.pivot_state[0]) > 0, "late 90 deg turn not done on the spot"
+
+
+def test_pivot_retargeted_by_a_redecide_turns_the_short_way(monkeypatch):
+    """Level 9 seed 15 random ends: rotating east (counter-clockwise) in the corner (7, 0), loose boxes threw the
+    robot back into the spike lane (7, 1); re-deciding there turned the pivot south, 40 deg clockwise from its yaw,
+    but it kept rotating counter-clockwise (the sign chosen for the old goal) and swept 330 deg inside the lane into
+    the spikes. A changed goal heading picks the rotation sign again."""
+    p = _pilot(monkeypatch)
+    for d in (0, 1, 2):
+        _close_wall(p, 1, 1, d)  # (1, 1): the only way on is back south to (1, 0)
+    p.ap.walls[0, 1, 1, 3] = p.ap.walls[0, 1, 0, 1] = 0
+    _set_plan(p, origin=(1, 0), target=(2, 0), heading=0)  # Was turning east in (1, 0)
+    p.pivot_state[0], p.pivot_yaw[0], p.pivot_dir[0] = 3, 0.0, 1.0  # ... rotating counter-clockwise
+    cmd = p.act(_obs((2.1, 1.1), lambda xy: torch.zeros(len(xy)), t=1.0, yaw=-0.89))  # Thrown north into (1, 1)
+    assert int(p.ap.heading[0]) == 3, "setup: should re-decide south from (1, 1)"
+    assert int(p.pivot_state[0]) > 0, "setup: the pivot should go on toward the new direction"
+    w = float(cmd[0, 2])
+    assert w < 0.0, f"rotating {w:+.2f} rad/s (counter-clockwise, 5.6 rad) instead of 0.7 rad clockwise to the south"
 
 
 def test_spike_lane_lined_up_before_the_bed_when_far_off_lane(monkeypatch):

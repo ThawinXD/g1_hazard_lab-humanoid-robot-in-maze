@@ -82,7 +82,21 @@ PIVOT_ROUGH_EXIT = 0.35  # A turn-back decided in a rough cell walks on into the
 STUCK_CHECK_PERIOD = 10.0  # challenge.py: < 0.25 m moved between checks every 10 s of sim time = STUCK (reset)
 STUCK_GUARD_WINDOW = 1.5  # Look ahead this long before each check [s]
 STUCK_GUARD_DIST = 0.35  # Keep at least this far from the previous check's position at check time [m]
+STUCK_GUARD_THROUGH = 0.5  # Walk on through that position at the speed already commanded, but at least this [m/s]
+STUCK_GUARD_LAG = 0.6  # The robot keeps its measured velocity this long after the guard takes over [s] (level 7 seed 2:
+# commanded from 0.9 down to -0.25 m/s at 18.52 s, it still walked on at 0.38-0.43 m/s until 19.1 s)
+STUCK_GUARD_GAIN = (0.83, 0.55, 0.5)  # Share of a forward / backward / sideways command the policy reaches (backing at
+# -0.25 m/s: 0.12-0.15 m/s in level 7 seed 2; sideways: scripts/strafe_test.py, 48-66%)
 STUCK_BLAME_DIST = 0.5  # A stall blames a ramp / trench target only when the pelvis is this close to its edge [m]
+# Ramp vs spike bed from a one-sided view: a ramp's slope is a plane (height linear in |u|, the same across the
+# corridor), cones are not. Fit z = a + b |u| + c v to the in-cell hits on it (0.02 < z < 0.42, |u| > 0.25, off the flat
+# top). Real geometry (tools/plane_stats.py, scans recreated along 44 traced runs, views with >= 8 such hits): 14,140
+# ramp views all fit to 0.000 m; 25,392 spike lane / slalom views none below 0.0065 m (0.0147 m with a ramp-like slope
+# and tilt)
+SLOPE_FIT_RMS = 0.002  # Ramp if the fit's RMS residual is below this [m] ...
+SLOPE_MIN_POINTS = 8  # ... over at least this many hits spread over 0.15 m of |u| ...
+SLOPE_RANGE = (-0.45, -0.12)  # ... with the height falling off toward the cell border at a ramp's slope (0.10-0.30 m
+# over 0.75 m: -0.15 to -0.41) and no tilt across the corridor (|c| < 0.02)
 
 # Junction choice: the maze generator puts trenches, steep ramps, slaloms, spike lanes and low ramps only on the routes
 # from start to goal, fills the short route's plain cells with loose boxes, and gives cells off both routes (dead-end
@@ -189,6 +203,11 @@ class Pilot:
         self.safe_offset = torch.zeros(
             (num_envs, num_cells, num_cells, 2), dtype=torch.float32, device=device
         )
+        # Sides with elevated hits seen so far in each cell's [u < 0 half, u > 0 half] (bit 1: v < 0, bit 2: v > 0),
+        # accumulated over scans. A spike bed never reaches past the corridor's middle and the two slalom beds lie in
+        # opposite halves, so both sides in one half can only be a ramp seen in pieces (level 9 seed 20 / seed 47 random
+        # ends: a steep ramp's slope foot seen on one side, then on the other, became a slalom and the robot fell)
+        self.elev_sides = torch.zeros((num_envs, num_cells, num_cells, 2), dtype=torch.long, device=device)
 
         # Mark start and goal cells as known plain floor (never contain hazards)
         si, sj = self.start_cell  # Unpack start cell indices
@@ -269,6 +288,8 @@ class Pilot:
             return  # Cell is too far outside the 3.2x3.2m scanner window
 
         axis = self._corridor_axis(env_id, ci, cj, fallback_axis)  # Get corridor axis (0=X, 1=Y)
+        if int(self.cell_axis[env_id, ci, cj].item()) != axis:  # Axis changed (walls found): old halves don't apply
+            self.elev_sides[env_id, ci, cj] = 0
         self.cell_axis[env_id, ci, cj] = axis  # Cache corridor axis for waypoint generation
         u = dx[in_cell] if axis == 0 else dy[in_cell]  # Longitudinal coordinate along corridor [-0.8, +0.8]
         v = dy[in_cell] if axis == 0 else dx[in_cell]  # Lateral coordinate across corridor [-0.8, +0.8]
@@ -299,6 +320,14 @@ class Pilot:
             q_pp = int((u_pos & v_pos).sum().item())  # Elevated hits in (u > 0, v > 0) quadrant
             tot_vn = int(v_neg.sum().item())  # Total elevated hits on negative lateral side
             tot_vp = int(v_pos.sum().item())  # Total elevated hits on positive lateral side
+            seen = self.elev_sides[env_id, ci, cj]  # Sides seen elevated per half so far (view: updated in place)
+            seen[0] = seen[0] | (1 if q_nn >= 2 else 0) | (2 if q_np >= 2 else 0)  # u < 0 half
+            seen[1] = seen[1] | (1 if q_pn >= 2 else 0) | (2 if q_pp >= 2 else 0)  # u > 0 half
+            both_in_half = bool((seen == 3).any())  # Both sides elevated in one half (over scans): only a ramp
+            # A ramp's slope seen from one side (level 9 seed 20: a yawed scan caught one corner of the ramp's foot and
+            # the robot lined up sideways for a "spike lane" on ice for 2.6 s, then spun out on the run-up)
+            smooth = self._smooth_slope(u, v, z)
+            ramp_evidence = both_in_half or smooth  # Proof of a ramp that no spike bed can give
 
             # Check center longitudinal band (|u| < 0.22 m): ramps have flat top here, slaloms have a 0.6 m gap
             mid_band = torch.abs(u_e) < 0.22  # Rays near longitudinal center of cell
@@ -310,7 +339,8 @@ class Pilot:
             pos_has_one_side = (q_pn >= 2 and q_pp <= 1) or (q_pp >= 2 and q_pn <= 1)  # Asymmetric in u > 0
             opposite_sides = (q_nn > q_np) != (q_pn > q_pp)  # Active side flips between u < 0 and u > 0
 
-            if neg_has_one_side and pos_has_one_side and opposite_sides and (mid_vn + mid_vp) <= 2:
+            slalom_now = neg_has_one_side and pos_has_one_side and opposite_sides and (mid_vn + mid_vp) <= 2
+            if slalom_now and not ramp_evidence:
                 s_neg = -1.0 if q_nn > q_np else 1.0  # Spike side in u < 0 half (-1 or +1)
                 s_pos = -1.0 if q_pn > q_pp else 1.0  # Spike side in u > 0 half (-1 or +1)
                 self.safe_offset[env_id, ci, cj, 0] = -s_neg * self.safe_lane_offset  # Safe lane for u < 0
@@ -320,10 +350,12 @@ class Pilot:
 
             # Ramp test: both v < 0 and v > 0 are elevated simultaneously in the same longitudinal slice
             same_slice_sym = (q_nn >= 2 and q_np >= 2) or (q_pn >= 2 and q_pp >= 2) or (mid_vn >= 1 and mid_vp >= 1)
-            if same_slice_sym and min(tot_vn, tot_vp) >= 2:
-                # Do not overwrite an already confirmed slalom cell
+            if (same_slice_sym and min(tot_vn, tot_vp) >= 2) or ramp_evidence:
+                # Do not overwrite an already confirmed slalom cell (seen along the wrong axis a slalom's beds can
+                # look symmetric in the middle band), unless both sides were elevated in one half or the hits lie on
+                # a smooth slope, which no slalom does
                 prev_type = int(self.cell_type[env_id, ci, cj].item())  # Existing classification
-                if prev_type != CELL_SPIKE_SLALOM:
+                if prev_type != CELL_SPIKE_SLALOM or ramp_evidence:
                     top_seen = int((torch.abs(u) < 0.20).sum().item()) >= 3  # Flat top (|u| <= 0.25) is in view
                     if top_seen:
                         # Use 90th percentile height to distinguish Steep Ramp (0.24-0.30 m) from Low Ramp (0.10-0.18 m)
@@ -344,14 +376,15 @@ class Pilot:
                     return
                 spike_side = -1.0 if tot_vn > tot_vp else 1.0  # Side occupied by the spike cones (-1 or +1)
                 safe_v = -spike_side * self.safe_lane_offset  # Free lane is on the opposite side (+-0.48 m)
-                # Check if we previously saw spikes on the opposite side in the other longitudinal half (slalom!)
-                old_u0 = float(self.safe_offset[env_id, ci, cj, 0].item())  # Previous u < 0 safe offset
-                old_u1 = float(self.safe_offset[env_id, ci, cj, 1].item())  # Previous u > 0 safe offset
-                if (q_nn + q_np) >= 2 and (q_pn + q_pp) == 0 and old_u1 != 0.0 and old_u1 * safe_v < 0:
+                # Slalom if spikes on the opposite side were seen in the OTHER longitudinal half: the safe offsets alone
+                # can't tell, both halves get the same offset from a view of one half (a ramp's foot seen on both sides
+                # of one half passed this test, level 9 seed 20)
+                opp_bit = 2 if spike_side < 0 else 1  # Bit of the opposite side in elev_sides
+                if (q_nn + q_np) >= 2 and (q_pn + q_pp) == 0 and int(seen[1].item()) & opp_bit:
                     self.safe_offset[env_id, ci, cj, 0] = safe_v  # Record u < 0 offset
                     self._set_cell_hazard(env_id, ci, cj, CELL_SPIKE_SLALOM)  # Upgrade to SLALOM
                     return
-                if (q_pn + q_pp) >= 2 and (q_nn + q_np) == 0 and old_u0 != 0.0 and old_u0 * safe_v < 0:
+                if (q_pn + q_pp) >= 2 and (q_nn + q_np) == 0 and int(seen[0].item()) & opp_bit:
                     self.safe_offset[env_id, ci, cj, 1] = safe_v  # Record u > 0 offset
                     self._set_cell_hazard(env_id, ci, cj, CELL_SPIKE_SLALOM)  # Upgrade to SLALOM
                     return
@@ -396,6 +429,22 @@ class Pilot:
             return float(y.max().item())
         slope = ((x - x_mean) * (y - y_mean)).sum() / var  # dz / d|u| (negative on a ramp)
         return float((y_mean + slope * (0.25 - x_mean)).item())  # Height at the top edge |u| = 0.25 m
+
+    @staticmethod
+    def _smooth_slope(u: torch.Tensor, v: torch.Tensor, z: torch.Tensor) -> bool:
+        """True if the raised in-cell hits lie on one plane falling off toward the cell border: a ramp's slope, not
+        cones (see SLOPE_FIT_RMS). ``u``, ``v``, ``z``: in-cell rays along / across the corridor and their heights."""
+        sel = (z > 0.02) & (z < 0.42) & (torch.abs(u) > 0.25)  # On a slope or a cone, off the floor and the flat top
+        if int(sel.sum().item()) < SLOPE_MIN_POINTS:
+            return False
+        au, vs, zs = torch.abs(u[sel]), v[sel], z[sel]
+        if float((au.max() - au.min()).item()) < 0.15:  # One row only: the slope along the corridor is unknown
+            return False
+        a = torch.stack((torch.ones_like(au), au, vs), dim=1).double()  # Model z = c0 + c1 |u| + c2 v
+        coef = torch.linalg.lstsq(a, zs.double().unsqueeze(1)).solution.squeeze(1)
+        rms = float(torch.sqrt(((a @ coef - zs.double()) ** 2).mean()).item())  # Fit residual [m]
+        slope, tilt = float(coef[1].item()), float(coef[2].item())
+        return rms < SLOPE_FIT_RMS and SLOPE_RANGE[0] <= slope <= SLOPE_RANGE[1] and abs(tilt) < 0.02
 
     def _set_cell_hazard(self, env_id: int, ci: int, cj: int, hazard_type: int):
         """Update cell classification and recompute its traversal cost (base cost + death penalty)."""
@@ -961,6 +1010,14 @@ class Pilot:
         (along the axis, so a safe lane next to a spike bed is kept). The prediction uses the measured velocity
         ``vel_b`` when given: a robot snagged on a box while commanded 0.9 m/s was predicted well clear, and the
         guard woke only 0.56 s before the check (level 7 seed 2, (4, 0): reset).
+
+        Stopping or backing away is not always the farther side: the robot walks on for ~0.6 s after a new command
+        and backs at only ~0.14 m/s (level 7 seed 2, back from the dead end east of (4, 0): 0.33 m short of the spot
+        at 0.36 m/s, it backed away, was carried to 0.14 m and ended 0.21 m from it: reset). So also predict walking
+        on through the spot along the travel direction (at the speed already commanded, at least
+        STUCK_GUARD_THROUGH) and do that when it ends farther from the spot, but only facing within 45 deg of the
+        travel direction, from a plain / rough cell, and either stopping 0.45 m short of the cell border ahead or into
+        an open plain / rough cell (never into a wall or a hazard cell without the pilot's lining up and speed rules).
         """
         to_check = (STUCK_CHECK_PERIOD - self.sim_time % STUCK_CHECK_PERIOD) % STUCK_CHECK_PERIOD
         if to_check <= 0.0 or to_check > STUCK_GUARD_WINDOW:
@@ -972,14 +1029,58 @@ class Pilot:
         if float(torch.linalg.norm(pos + v_w * to_check - ref).item()) > STUCK_GUARD_DIST:
             return None  # Will be far enough from the last check's position anyway
         away = pos - ref
+        hd = int(self.ap.heading[env_id].item())  # Travel direction
+        axis = self.ap._dirs[hd].float()  # Corridor axis of the travel direction
+        ax, ay = float(axis[0].item()), float(axis[1].item())
         if float(torch.linalg.norm(away).item()) > STUCK_GUARD_DIST:
-            return 0.0, 0.0, 0.0  # Already far enough: just stop here until the check has passed
-        axis = self.ap._dirs[self.ap.heading[env_id]].float()  # Corridor axis of the travel direction
-        sign = 1.0 if float((away * axis).sum().item()) >= 0.0 else -1.0
-        dx, dy = float(axis[0].item()) * sign * 0.35, float(axis[1].item()) * sign * 0.35  # 0.35 m/s along the axis
-        v = max(min(dx * c + dy * s, 0.5), -0.25)  # Body frame, within the trained command ranges
-        vy = max(min(-dx * s + dy * c, 0.35), -0.35)
-        return v, vy, 0.0
+            old = (0.0, 0.0, 0.0)  # Already far enough: just stop here until the check has passed
+        else:  # Step away from the spot on the side the robot is on, 0.35 m/s along the axis
+            sign = 1.0 if float((away * axis).sum().item()) >= 0.0 else -1.0
+            dx, dy = ax * sign * 0.35, ay * sign * 0.35
+            v = max(min(dx * c + dy * s, 0.5), -0.25)  # Body frame, within the trained command ranges
+            vy = max(min(-dx * s + dy * c, 0.35), -0.35)
+            old = (v, vy, 0.0)
+
+        hold = min(to_check, STUCK_GUARD_LAG)  # Time the robot keeps its measured velocity
+
+        def end_pos(cmd: tuple) -> torch.Tensor:  # Predicted position at check time under body command ``cmd``
+            gx = STUCK_GUARD_GAIN[0] if cmd[0] > 0.0 else STUCK_GUARD_GAIN[1]
+            rx, ry = cmd[0] * gx, cmd[1] * STUCK_GUARD_GAIN[2]  # Body velocity the policy reaches
+            r_w = torch.tensor((rx * c - ry * s, rx * s + ry * c), dtype=pos.dtype, device=pos.device)  # Maze frame
+            return pos + v_w * hold + r_w * (to_check - hold)
+
+        # Walking on through: only from a plain / rough cell (not ice, where the turn place matters, nor a spike cell)
+        cell = self.ap.cell_of(pos.unsqueeze(0))[0]
+        ci, cj = int(cell[0].item()), int(cell[1].item())
+        if int(self.cell_type[env_id, ci, cj].item()) not in (CELL_PLAIN, CELL_ROUGH):
+            return old
+        cv, cvy = float(self.ap.cmd[env_id, 0].item()), float(self.ap.cmd[env_id, 1].item())
+        along = (cv * c - cvy * s) * ax + (cv * s + cvy * c) * ay  # Speed commanded along the travel direction now
+        speed = max(STUCK_GUARD_THROUGH, min(along, self.fast_speed))  # The pilot's own speed, >= 0.5 m/s
+        tv, tvy = speed * (ax * c + ay * s), speed * (-ax * s + ay * c)  # Body frame
+        # Walking, not stepping sideways: only facing within 45 deg of the travel direction (level 9 seed 5 random ends,
+        # mid-turn in the rough corner (5, 4): "through" was a 0.35 m/s sideways step on loose boxes)
+        if tv < 0.7 * speed:
+            return old
+        # Scale (not clip) into the trained command ranges, so the step stays exactly along the axis
+        k = min(1.0, (self.fast_speed if tv > 0.0 else 0.25) / max(abs(tv), 1e-6), 0.35 / max(abs(tvy), 1e-6))
+        through = (tv * k, tvy * k, 0.0)
+        # Walls and hazards ahead: end at least 0.45 m short of the cell border (0.375 m from a wall's face), or the
+        # side ahead must be known open onto a plain / rough cell
+        u = float(((pos - self.ap.centre_of(cell.unsqueeze(0))[0]) * axis).sum().item())  # Along the axis in the cell
+        reach = max(float((v_w * axis).sum().item()), 0.0) * hold + speed * (to_check - hold)  # Travel, upper bound
+        ni, nj = ci + DIRS[hd][0], cj + DIRS[hd][1]  # Cell ahead
+        next_ok = (
+            0 <= ni < self.num_cells
+            and 0 <= nj < self.num_cells
+            and int(self.ap.walls[env_id, ci, cj, hd].item()) == 0
+            and int(self.cell_type[env_id, ni, nj].item()) in (CELL_PLAIN, CELL_ROUGH)
+        )
+        if not (next_ok or u + reach + 0.45 <= 0.5 * self.cell_size):
+            return old
+        d_old = float(torch.linalg.norm(end_pos(old) - ref).item())  # Predicted distance from the spot at check time
+        d_through = float(torch.linalg.norm(end_pos(through) - ref).item())
+        return through if d_through > d_old else old
 
     def _start_pivot(self, env_id: int, direction: int):
         """Begin a turn-back on the spot toward cardinal ``direction`` (0=E, 1=N, 2=W, 3=S): brake first."""
@@ -1237,9 +1338,14 @@ class Pilot:
                     self._plan_rough_exit(b, cell[b], old, float(u_along[b].item()), float(yaw[b].item()))
             self.ap.heading[idx] = d  # Update chosen travel direction
             dirs_f = self.ap._dirs[d].float()  # A pivot already under way rotates to the newly chosen direction
-            self.pivot_yaw[idx] = torch.where(
-                self.pivot_state[idx] > 0, torch.atan2(dirs_f[:, 1], dirs_f[:, 0]), self.pivot_yaw[idx]
-            )
+            new_yaw = torch.atan2(dirs_f[:, 1], dirs_f[:, 0])  # Heading of the newly chosen direction
+            turn = new_yaw - self.pivot_yaw[idx]  # Change of the pivot's goal heading
+            # ... and picks its rotation sign again: the old one could go the long way round (level 9 seed 15 random
+            # ends: thrown back into a spike lane while turning east, the re-decide turned it south, and keeping the
+            # sign rotated it 330 deg instead of 40 inside the lane, into the spikes)
+            retarget = (self.pivot_state[idx] > 0) & (torch.atan2(torch.sin(turn), torch.cos(turn)).abs() > 0.1)
+            self.pivot_dir[idx] = torch.where(retarget, torch.zeros_like(self.pivot_dir[idx]), self.pivot_dir[idx])
+            self.pivot_yaw[idx] = torch.where(self.pivot_state[idx] > 0, new_yaw, self.pivot_yaw[idx])
             self.ap.target[idx] = (cell[idx] + self.ap._dirs[d]).clamp(0, self.num_cells - 1)  # Next target cell
             self.ap.origin[idx] = cell[idx]  # Record decision origin cell
             self.ap.need_decision[idx] = False  # Clear decision flag

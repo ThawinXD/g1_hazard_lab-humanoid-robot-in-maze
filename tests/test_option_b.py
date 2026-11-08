@@ -78,6 +78,7 @@ def test_pilot_classifies_all_hazard_types_and_safe_lanes():
 
     # 4. Single-Lane Spike Bed on +y side (dy in [0.05, 0.85]) -> safe lane must be on -y (-0.48 m)
     p.cell_type[0, 1, 0] = 0
+    p.elev_sides[0, 1, 0] = 0  # A fresh cell: forget the ramps' elevated sides (a real cell never changes hazard)
     z_spike_pos = torch.where((torch.abs(dx) < 0.65) & (dy > 0.05) & (dy < 0.85), 0.30, 0.0)
     p._classify_cell_from_scan(0, 1, 0, scan_xy[0], z_spike_pos, fallback_axis=0)
     assert int(p.cell_type[0, 1, 0].item()) == CELL_SPIKE_LANE
@@ -86,6 +87,7 @@ def test_pilot_classifies_all_hazard_types_and_safe_lanes():
     # 5. Slalom Spike Cell: u < -0.3 has spikes on +y, u > +0.3 has spikes on -y, center gap is flat
     p.cell_type[0, 1, 0] = 0
     p.safe_offset[0, 1, 0] = 0.0
+    p.elev_sides[0, 1, 0] = 0  # A fresh cell
     bed1 = (dx > -0.85) & (dx < -0.30) & (dy > 0.05) & (dy < 0.85)
     bed2 = (dx > 0.30) & (dx < 0.85) & (dy < -0.05) & (dy > -0.85)
     z_slalom = torch.where(bed1 | bed2, 0.30, 0.0)
