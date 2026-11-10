@@ -65,6 +65,13 @@ PYTHONIOENCODING=utf-8 uv run python scripts/rough_test.py --checkpoint <model.p
 PYTHONIOENCODING=utf-8 uv run python scripts/strafe_test.py --checkpoint <model.pt>
 ```
 
+Lining up for a spike lane right after a rough corner (lane on the outside of the turn), pilot.py's sideways step vs
+curves (`CORNER_MODES`, `CORNER_TIME`, `CORNER_REPEATS`; handoff.md §3 "Rough-corner line-up"):
+
+```bash
+PYTHONIOENCODING=utf-8 uv run python scripts/corner_lineup_test.py --checkpoint <model.pt>
+```
+
 Training: `uv run isaaclab train --rl_library rsl_rl --task G1-Hazard-Challenge --num_envs 1024 --checkpoint <ckpt>`
 (`G1-Hazard-Pro` trained `model_8497`; `G1-Hazard-Challenge` adds real ice, pilot-like commands, a sideways reward and
 harder hazards, see handoff.md §3). Checkpoints land in `logs/rsl_rl/<experiment>/<run>/` (git-ignored). Judge a new

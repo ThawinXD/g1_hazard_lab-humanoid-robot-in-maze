@@ -13,10 +13,11 @@ Use this file to pick the work up in a new session. The full write-up of methods
 | Pilot changes (2026-11-04) | In the working tree, **not committed**: rough-floor speed 0.9 (`ROUGH_SPEED`), turn-backs moved off rough floor (`PIVOT_ROUGH_EXIT`), rough corners into ice at rough speed (`ICE_SLOW_DIST`), the old 0.68 before trenches, and the stuck guard using measured velocity. Benchmark **638.7 s and 641.0 s, 0 falls** (bar 685 / 685); residual risk at L9 seed 2's trench (section 3, "Rough corners into ice, trench approach, stuck guard"). Plus (2026-11-05) the re-decide when a late turn ends in the next cell (`lost`, L9 seed 50): seed 50 crash gone in 3 of 3 runs, benchmark 645.8 s / 0 falls and 728.4 s / 1 trench fall not caused by it (section 3, "Late turn that ends in the next cell"). |
 | Pilot changes (2026-11-07, committed `95c9dc8`) | Ice turns always at the ice edge, slalom stage 2 only inside the gap, unstuck reflex without turning in spike cells. Slalom sweep over 8 mazes' entries (0 spike hits in 7 crossings); benchmark 645.8 / 644.6 / 655.6 s, 0 falls (section 3, "Slalom sweep, ice turns at the edge, ..."). |
 | Route hints (2026-11-08, committed `95c9dc8`) | At a junction, prefer a branch whose next cell shows a hazard only routes carry (or loose boxes): exploring −8% on six extra mazes, no decision changed on 7 of the 8 benchmark mazes (section 3, "Route hints at junctions"). |
-| Slalom sweep 2 + ramp classifier (2026-11-08, in the working tree) | 36 more level 9 mazes on the forced short route: **31 slalom crossings, 0 spike hits** (38 / 38 with the first sweep). Of the 6 falls elsewhere, 2 were steep ramps taken for a slalom and 1 a turn on the spot that rotated the long way inside a spike lane; fixed (ramp evidence per half, smooth-slope test, rotation sign re-chosen). Offline audit over the 44 sweep runs: no spike cell ever called a ramp, ramps misread as spike cells 69 s → 0.1 s. Benchmark 648.8 / 647.7 s (without the smooth-slope test) and 765.9 / 649.8 s (final); its falls and resets (L9 seed 2's trench, sideways staging on rough floor, L7 seed 2's 10 s stuck check) were traced to known problems, none to these changes (section 3, "Slalom sweep 2: ramps taken for spike cells, turn direction"). |
-| Stuck guard walks on through (2026-11-08, in the working tree) | On the way back from a dead end toward the last 10 s check's spot (L7 seed 2's two resets), `_stuck_guard` now keeps walking through the spot at the commanded speed when that is predicted to end farther than stopping / backing, only facing the travel direction, on plain / rough floor and never into a wall or hazard cell. Benchmark 647.8 / 644.6 s, 0 falls or resets (first version 651.3 / 769.0 s; the 3 falls were L9 seed 2's trench and ice turns, guard idle). 16 L7 seed 2 runs, 0 resets, but the deep snag did not recur, so the new branch is checked by tests only (section 3, "Stuck guard: walk on through"). |
-| Tests | `uv run pytest tests`: **118 pass** (no simulator needed). |
-| Git | Branch `side-test`. Everything through the route hints is committed (`git log` for the latest commit; `tools/` and `logs/` are git-ignored, so the checkpoint is not in git). Ask before committing. |
+| Slalom sweep 2 + ramp classifier (2026-11-08, committed `040977b`) | 36 more level 9 mazes on the forced short route: **31 slalom crossings, 0 spike hits** (38 / 38 with the first sweep). Of the 6 falls elsewhere, 2 were steep ramps taken for a slalom and 1 a turn on the spot that rotated the long way inside a spike lane; fixed (ramp evidence per half, smooth-slope test, rotation sign re-chosen). Offline audit over the 44 sweep runs: no spike cell ever called a ramp, ramps misread as spike cells 69 s → 0.1 s. Benchmark 648.8 / 647.7 s (without the smooth-slope test) and 765.9 / 649.8 s (final); its falls and resets (L9 seed 2's trench, sideways staging on rough floor, L7 seed 2's 10 s stuck check) were traced to known problems, none to these changes (section 3, "Slalom sweep 2: ramps taken for spike cells, turn direction"). |
+| Stuck guard walks on through (2026-11-08, committed `040977b`) | On the way back from a dead end toward the last 10 s check's spot (L7 seed 2's two resets), `_stuck_guard` now keeps walking through the spot at the commanded speed when that is predicted to end farther than stopping / backing, only facing the travel direction, on plain / rough floor and never into a wall or hazard cell. Benchmark 647.8 / 644.6 s, 0 falls or resets (first version 651.3 / 769.0 s; the 3 falls were L9 seed 2's trench and ice turns, guard idle). 16 L7 seed 2 runs, 0 resets, but the deep snag did not recur, so the new branch is checked by tests only (section 3, "Stuck guard: walk on through"). |
+| Rough-corner line-up (2026-11-09/10, in the working tree, **off**) | Lining up for a spike cell right after a rough corner (sideways step while turning) falls in ~3% of such corners. A curve around a corner point 0.20 m inside the lane line (`LANE_CURVE_INSET`), at the rough-floor speed, instead: `scripts/corner_lineup_test.py` 4.0% → 0.2% falls, 3 s faster, S-bend run-in included. With it on (run snapshots): benchmark **660.5 s (1 fall: an ice turn, unrelated) / 640.4 s, 0 falls**; 12 curves in the maze, 0 falls, incl. the two corners that failed with the first version. Still behind `ROUGH_CORNER_CURVE = False` until switched on (section 3, "Rough-corner line-up"). |
+| Tests | `uv run pytest tests`: **121 pass** (no simulator needed). |
+| Git | Branch `side-test`. Everything through the slalom sweep 2 fixes and the stuck guard is committed (`git log` for the latest commit; `tools/` and `logs/` are git-ignored, so the checkpoint is not in git). Ask before committing. |
 | Submission | Upload `model_8497.pt` as `policy.pt` plus `pilot.py`. `PILOT_MODE` already defaults to `short` (the runner sets no env vars). |
 
 ### Latest benchmark (two runs each; simulator runs vary)
@@ -717,7 +718,7 @@ walking pace (0–0.25 m/s while turning), and, after that reset, sideways stagi
 stumbled into the wall; run 2 of that maze was clean (85.2 s). L9 seed 2 run 2 (97.7 s) had a snag and the unstuck
 reflex on the same route.
 
-### Slalom sweep 2: ramps taken for spike cells, turn direction (2026-11-08, in the working tree)
+### Slalom sweep 2: ramps taken for spike cells, turn direction (2026-11-08, committed `040977b`)
 
 **Sweep.** 36 level 9 mazes not run before, forced onto the short route (`tools/force_route.py`, one run each),
 chosen from `logs/slalom_scan_L9.txt` to cover every way into a slalom: straight (rough, ice, after a trench / steep
@@ -818,7 +819,7 @@ classifier changes never touch rough cells); the stuck guard backed it away from
 the same side), momentum carried it to 0.14 m and it ended 0.21 m from the spot (limit 0.25 m). Fixed in the next
 section (walking on through at the commanded speed; a fixed 0.5 m/s would not have been enough).
 
-### Stuck guard: walk on through the last check's spot (2026-11-08, in the working tree)
+### Stuck guard: walk on through the last check's spot (2026-11-08, committed `040977b`)
 
 **Problem** (the two L7 seed 2 resets above; traces `v5_bench` run 1 and `v6_bench` run 2 of the slalom sweep 2
 session). The guard's command ramps from the 0.9 m/s rough-floor speed toward −0.25 m/s at 2 m/s², but the robot keeps
@@ -871,6 +872,71 @@ every guard episode per 10 s check, `uv run python guard_report.py <trace.csv> .
 `C:\Users\user\AppData\Local\Temp\claude\746074aed36627eb\68de3be3-5f37-4a3b-9bfe-a4792e8b4966\scratchpad\guard\`
 (`v2\` = final code).
 
+### Rough-corner line-up: sideways step vs a curve (2026-11-09/10, in the working tree, off by default)
+
+**Problem.** Before a spike lane / slalom whose free lane is not straight ahead, the pilot lines up by stepping
+sideways while turning to face the corridor (staging, `STAGE_HOLD_U`). Over the traced runs since 2026-11-07
+(scratchpad `staging_stats.py` / `staging_corner.py`): rough corners 101 line-ups, **3 falls** (L9 seed 11 back into the
+trench cell, L9 seed 2 (4, 6) and L9 seed 3 (5, 6) on the boxes), plus L9 seed 44 random ends (snag, then the unstuck
+reflex into the wall); rough straight 27 / 0; plain corners 37 / 0. 99 of the 101 rough-corner cases have the lane on
+the **outside** of the turn (0.63 m on along the way the robot walked in).
+
+**Policy test** (new `scripts/corner_lineup_test.py`, task `G1-Rough-Test`'s L corridors: robots walk into the rough
+corner cell, the cell after it is treated as a spike cell with the lane 0.48 m to the outside; pilot.py's controllers
+copied; finish where the bed starts, u = −0.70):
+
+| Maneuver | Robots | Fell / crashed | Stuck at 16 s | Snagged | Time | Lateral at u = −1.2 (min / median / max) |
+|---|---|---|---|---|---|---|
+| Sideways step while turning (pilot) | 1,250 | **4.0%** | 3.3% | 24% | 7.0 s | −0.60 / 0.28 / 0.79 |
+| Walk on to the centreline, then the diagonal | 750 | 0.7% | 2.7% | 25% | 6.4 s | — (one at −0.53 at the bed) |
+| Curve, ≤ 0.5 m/s | 750 | 0.7% | 1.9% | 26% | 6.0 s | — |
+| Curve, ≤ 0.7 m/s | 1,250 | 0.2% | 0 | 6% | 4.5 s | 0.36 / 0.57 / 0.74 |
+| **Curve, ≤ 0.9 m/s (rough speed)** | 1,250 | **0.2%** | 0 | **0.6%** | **3.7 s** | 0.42 / 0.59 / 0.71 |
+
+The sideways step's falls cluster at the lane entry 0.74 m out (it overshoots toward the outer wall); slow line-ups on
+boxes snag (as in the rough-floor test, slower is worse). "Curve" = pilot.py's pure-pursuit curve (1 m lookahead,
+0.6 m/s² sideways limit, no v_y) along previous cell centre → corner centre moved out to the lane line → lane entry.
+
+**Implemented** in `_compute_waypoint_and_speed` Case 2 (`lane_curve`: rough corner cell, 90° turn, still in the corner
+cell, lane on the outside; `_polyline_point` factored out of `_pursuit_point`), tests
+`test_rough_corner_into_outside_lane_is_walked_as_a_curve` (flag on; fails on the old pilot),
+`test_rough_corner_curve_is_off_by_default`, `test_rough_corner_into_inside_lane_keeps_the_usual_approach`.
+
+**Maze runs with the curve on** (stopped early by a session restart):
+
+| Runs | Result |
+|---|---|
+| Benchmark run 1 (8 mazes) | 892.3 s, 2 falls, both unrelated: L9 seed 5 random ends turning on the spot in rough (6, 4), then an ice turn at (7, 8) sliding back into the spike lane (7, 7). L7 seed 4 random ends 43.8 s (was 47.0), L9 seed 2 87.4 s (was 89.4–89.9). |
+| Benchmark run 2 (5 of 8) | L7 seeds 1–4 59.0 / 85.8 / 78.2 / 43.8 s, L9 seed 1 116.9 s, 0 falls |
+| Forced short route, 11 runs (L9 seeds 1, 11, 24, 44 / 21 / 48 random ends, L7 seed 3) | 3 falls. L7 seed 3: an ice turn sliding back into a spike lane (unrelated). **L9 seed 11 run b:** an S-bend ((0, 7) → (1, 7) → (1, 6)), the robot entered the rough corner (1, 6) at 0.9 m/s still turning, the curve only bends 1 m before the moved corner point, it ran 0.33 m past the lane line (0.81 m off the centreline) and an arm hit the wall. **L9 seed 24 run b:** 0.22 m past the lane into the slalom (2, 5), stage 1 steered back over 0.9 m and left it 35° askew when stage 2 stepped across the gap: spike hit. Run a of both was clean (overshoot 0.14 m). |
+
+So in the maze the curve overshoots outward more than in the test (straight 4 m run-ins only): **2 failures in about
+two dozen curve corners**, against ~3% for the sideways step. Kept behind `ROUGH_CORNER_CURVE = False`.
+
+**Second try (2026-11-10): corner point inside the lane line.** `corner_lineup_test.py` got an S-bend run-in
+(`CORNER_SBEND=0.45`: a 0.45 rad/s yaw-rate bias the wrong way in the last 1.2 m before the corner cell, as at L9 seed
+11), the farthest point out before the bed (pelvis > 0.70 m off the centreline = an arm near the wall face at 0.925),
+and `curveVVi<cm>` modes (corner point that far inside the lane line). 250 robots each, S-bend run-in, 0 falls in all:
+
+| Variant | > 0.70 m out | Farthest out | Lateral at u = −1.2 (min / median) | Snagged | Time |
+|---|---|---|---|---|---|
+| ≤ 0.9 m/s, corner on the lane line (first try) | 5.2% | 0.76 m | 0.42 / 0.57 | 0% | 3.79 s |
+| **≤ 0.9 m/s, corner 0.20 m inside** | **0.4%** | 0.70 m | 0.37 / **0.48** | 0% | 3.65 s |
+| ≤ 0.7 m/s, corner 0.15 m inside | 0% | 0.63 m | 0.31 / 0.46 | 6.4% | 4.42 s |
+
+`LANE_CURVE_INSET = 0.20`, `LANE_CURVE_SPEED = 0.9` (still behind `ROUGH_CORNER_CURVE = False`). Maze runs with the flag
+on (run snapshots only), 2026-11-10:
+
+| Runs | Result |
+|---|---|
+| Forced short route, L9 seed 11 × 2, L9 seed 24 × 2 | 95.4 / 96.3 s and 119.7 (1 fall) / 86.1 s. Seed 11's S-bend corner (1, 6) (the wall crash before) and seed 24's corner into the slalom (2, 5) (the spike hit before) clean in every run that reached them; seed 24 run a fell at the trench (1, 4) earlier (a normal corner into a trench, not this curve) |
+| Benchmark set 1 | L9 seed 2 83.9, L9 seed 5 random ends 84.5, L7 seed 4 random ends 44.3, L9 seed 3 87.0, L7 seed 1 59.6, L7 seed 2 105.9 (1 fall: an ice turn on the spot at (4, 3) after the spike lane, the known ice-turn problem), L7 seed 3 78.6, L9 seed 1 116.7: **660.5 s, 1 fall** |
+| Benchmark set 2 | L9 seed 2 86.7, L9 seed 5 random ends 82.1, L7 seed 4 random ends 44.0, L9 seed 3 88.1, L7 seed 1 59.5, L7 seed 2 85.4, L7 seed 3 78.2, L9 seed 1 116.4: **640.4 s, 0 falls** (committed pilot: 647.8 / 644.6 s; bar 638.7 / 641.0 s) |
+
+The curve ran 12 times in these runs (L9 seed 2, L7 seed 4 random ends, the forced mazes), 0 falls within 4 s of one; no
+sideways line-up on rough floor happened. Faster where it ran: L9 seed 2 83.9 / 86.7 s (89.4–89.9 before), L7 seed 4
+random ends 44.3 / 44.0 s (47.0–47.5).
+
 ## 4. Gotchas learned the hard way
 
 - **Runs vary.** The same seed can differ by 50+ s. Never judge a change from one run.
@@ -921,7 +987,11 @@ every guard episode per 10 s check, `uv run python guard_report.py <trace.csv> .
 ## 5. Open problems and next steps (in priority order)
 
 1. **Snags on rough floor** (a foot caught on a loose box): L7 seed 2 corner (3, 5) snags in every run, about 2 s,
-   and sometimes falls. L9 seed 5 snags before its slalom. See item 7. The rough-floor test (section 3) says slower
+   and sometimes falls. L9 seed 5 snags before its slalom. See item 7. **Lining up sideways at a rough corner before a
+   spike cell falls in ~3% of those corners** (4.0% of robots in `scripts/corner_lineup_test.py`). A curve instead
+   (`ROUGH_CORNER_CURVE`, off; corner point 0.20 m inside the lane, `LANE_CURVE_INSET`) passed the test, the forced
+   runs and a 2 × 8 benchmark (660.5 s with 1 unrelated ice-turn fall / 640.4 s, 0 falls) on 2026-11-10; switch it on
+   to use it (section 3, "Rough-corner line-up"). The rough-floor test (section 3) says slower
    is worse: 20–28% of robots snag at the pilot's 0.68 m/s, 4–8% at 0.9 m/s with no falls. `ROUGH_SPEED = 0.9` in the
    maze (section 3, "Rough floor at 0.9 m/s in the maze"), with the follow-up fixes for rough corners into ice, the
    trench approach and the stuck guard: 638.7 / 641.0 s, 0 falls (section 3, "Rough corners into ice, trench
@@ -976,7 +1046,7 @@ every guard episode per 10 s check, `uv run python guard_report.py <trace.csv> .
 9. **Stuck guard on the way back from a dead end** (`_stuck_guard`): it always stepped away from the last check's spot
    on the side the robot was on, even when the robot was walking toward and through that spot; backing at −0.25 m/s
    against the momentum left L7 seed 2 0.21 m from the spot (reset at t = 20 s, section 3, "Slalom sweep 2").
-   *Done 2026-11-08 (in the working tree):* the guard walks on through at the commanded speed (≥ 0.5 m/s) when that is
+   *Done 2026-11-08 (committed `040977b`):* the guard walks on through at the commanded speed (≥ 0.5 m/s) when that is
    predicted to end farther (a fixed 0.5 m/s would not have cleared that run), facing the travel direction, on plain /
    rough floor, never into a wall or hazard cell; benchmark 647.8 / 644.6 s, 0 falls (section 3, "Stuck guard: walk on
    through"). **Open:** not yet seen in a closed-loop run (the deep snag did not recur in 16 L7 seed 2 runs); if a

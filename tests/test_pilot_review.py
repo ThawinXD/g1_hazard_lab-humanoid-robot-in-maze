@@ -23,6 +23,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+import pilot as pilot_module  # noqa: E402  (module constants switched in some tests)
 from pilot import (  # noqa: E402
     CELL_ICE,
     CELL_LOW_RAMP,
@@ -826,6 +827,72 @@ def test_slalom_staging_steps_across_without_creeping_toward_the_bed(monkeypatch
     assert abs(float(wp[0]) - 8.48) < 0.01, f"staging point {wp.tolist()} is not on the entry lane"
     assert abs(float(wp[1]) - (10.0 - STAGE_HOLD_U)) < 0.01, f"staging point {wp.tolist()} creeps toward the bed"
     assert 10.0 - STAGE_HOLD_U <= 8.15, "staging hold point not near the corner cell's centre"
+
+
+def _rough_corner_into_spike_lane(monkeypatch, lane: float):
+    """Walking east into the rough corner (2, 0) (closed east) that turns north into the spike lane (2, 1); the lane
+    is ``lane`` m off the corridor's centre along x (+ = east, the outside of the turn)."""
+    p = _pilot(monkeypatch)
+    p.cell_type[0, 2, 0] = CELL_ROUGH
+    p.cell_type[0, 2, 1] = CELL_SPIKE_LANE
+    p.cell_axis[0, 2, 1] = 1
+    p.safe_offset[0, 2, 1] = lane
+    _close_wall(p, 2, 0, 0)
+    _set_plan(p, origin=(2, 0), target=(2, 1), heading=1)
+    p.prev_heading[0] = 0  # Came in heading east
+    return p
+
+
+def test_rough_corner_into_outside_lane_is_walked_as_a_curve(monkeypatch):
+    """Lining up for a spike cell by stepping sideways while turning on loose boxes fell 3 times in 101 line-ups at
+    rough corners (level 9 seed 11 back into a trench, seed 2 and seed 3 into walls); scripts/corner_lineup_test.py:
+    3.9% of 750 robots fell or crashed, against 0.1% walking the corner as a curve around a corner point moved out to
+    the lane at the rough-floor speed. A robot that follows the commands must not step sideways, must keep a brisk
+    pace, and must be in the lane, clear of the outer wall, where its knees reach the bed (pelvis u = -1.2).
+    (ROUGH_CORNER_CURVE is off by default: in the maze the curve overshot the lane after an S-bend.)"""
+    monkeypatch.setattr(pilot_module, "ROUGH_CORNER_CURVE", True)
+    p = _rough_corner_into_spike_lane(monkeypatch, 0.48)
+    pos, yaw = [3.1, 0.0], 0.0  # Just into the corner cell, walking east at the rough-floor speed
+    p.ap.cmd[0] = torch.tensor([ROUGH_SPEED, 0.0, 0.0])
+    flat = lambda xy: torch.zeros(len(xy))  # noqa: E731
+    lat_knees, x_max, v_max = None, -1e9, 0.0
+    for k in range(500):
+        cmd = p.act(_obs(tuple(pos), flat, t=1.0 + k * DT, yaw=yaw))
+        assert not bool(p.strafe[0]), f"stepping sideways at {pos} on the rough corner"
+        vx, vy, w = (float(c) for c in cmd[0])
+        v_max = max(v_max, vx)
+        pos[0] += (math.cos(yaw) * vx - math.sin(yaw) * vy) * DT
+        pos[1] += (math.sin(yaw) * vx + math.cos(yaw) * vy) * DT
+        yaw += w * DT
+        x_max = max(x_max, pos[0])
+        if lat_knees is None and pos[1] > 2.0 - 1.2:
+            lat_knees = pos[0] - 4.0
+        if pos[1] > 2.0 - 0.7:
+            break
+    assert pos[1] > 2.0 - 0.7, f"did not reach the bed's start in 10 s (at {pos})"
+    assert v_max > 0.6, f"crawled through the corner (top speed {v_max:.2f} m/s)"
+    assert lat_knees is not None and lat_knees > 0.30, f"{lat_knees} m off the centreline where the knees reach the bed"
+    assert abs(pos[0] - 4.48) < 0.15, f"at the bed's start x = {pos[0]:.2f}, lane x = 4.48"
+    # Real robots on this path (corner_lineup_test.py) reached 0.76 m off the centreline without touching the wall
+    assert x_max - 4.0 < 0.70, f"swung {x_max - 4.0:.2f} m off the centreline toward the outer wall"
+
+
+def test_rough_corner_curve_is_off_by_default(monkeypatch):
+    """With ROUGH_CORNER_CURVE off (the default) the rough corner keeps the sideways line-up of commit 040977b."""
+    p = _rough_corner_into_spike_lane(monkeypatch, 0.48)
+    xy, pos = _grid(3.1, 0.0), torch.tensor([3.1, 0.0])
+    p._compute_waypoint_and_speed(0, pos, 0.0, torch.tensor([2, 0]), xy, torch.zeros(len(xy)))
+    assert bool(p.strafe[0]) and not bool(p.on_curve[0]), "rough-corner curve active by default"
+
+
+def test_rough_corner_into_inside_lane_keeps_the_usual_approach(monkeypatch):
+    """The curve is only for a lane on the outside of the turn: with the lane on the inside, the waypoint is the usual
+    lane entry point."""
+    p = _rough_corner_into_spike_lane(monkeypatch, -0.48)
+    xy, pos = _grid(3.1, 0.0), torch.tensor([3.1, 0.0])
+    wp, _, _ = p._compute_waypoint_and_speed(0, pos, 0.0, torch.tensor([2, 0]), xy, torch.zeros(len(xy)))
+    assert abs(float(wp[0]) - 3.52) < 0.01 and abs(float(wp[1]) - 1.25) < 0.01, f"waypoint {wp.tolist()}"
+    assert not bool(p.on_curve[0]), "inside lane walked as the outside-lane curve"
 
 
 def test_no_lane_staging_when_off_lane_on_the_wall_side(monkeypatch):

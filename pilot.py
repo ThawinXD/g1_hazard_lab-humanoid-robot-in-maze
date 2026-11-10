@@ -54,6 +54,13 @@ SLALOM_HOLD_U = -0.10  # Pelvis position along the corridor [m] while strafing a
 STAGE_HOLD_U = 1.9  # Lining up sideways for a spike cell ahead: hold this far before its centre [m] (near the
 # previous cell's centre; at 1.4 the robot crept 0.5 m forward while stepping, ended 0.57 m before a slalom bed still in
 # line with it, and the turn toward the lane put a foot on the bed's corner: forced short route, L9 seed 1, 3 of 3 runs)
+ROUGH_CORNER_CURVE = False  # After a rough corner with the lane on the outside, line up with a curve instead of the
+# sideways step (Case 2). OFF: better in scripts/corner_lineup_test.py, but in the maze it overshot past the lane line
+# into a wall after an S-bend (level 9 seed 11) and into a slalom 35 deg askew (seed 24); handoff.md section 3
+LANE_CURVE_INSET = 0.20  # That curve bends around a corner point this far inside the lane line [m] (0 overshot:
+# corner_lineup_test.py with an S-bend run-in, 250 robots: 5.2% passed 0.70 m off the centreline toward the wall at 0,
+# 0.4% at 0.20, median 0.48 = the lane where the knees reach a slalom bed, at least 0.37 there; no falls, no snags) ...
+LANE_CURVE_SPEED = 0.9  # ... at most this fast [m/s]
 ROUTE_REPLAN_MARGIN = 1.0  # Re-decide when the target's cost-to-goal rose by more than this (e.g. found a dead end)
 LIDAR_WALL_VOTES = 3  # Lidar hits on one cell edge (accumulated over scans) needed to latch it as a wall
 LIDAR_OPEN_VOTES = 2  # Lidar rays passing through an unknown cell edge needed to mark it open
@@ -784,6 +791,7 @@ class Pilot:
         speed = self.fast_speed  # Default max speed is fast cruise speed (0.85 m/s)
         vy_bias = 0.0  # Default lateral velocity bias is 0.0 m/s
         self.strafe[env_id] = False  # Normal waypoint tracking unless the slalom crossover below turns it on
+        lane_curve_on = False  # Curve into a spike lane's entry around a rough corner (Case 2)
 
         # Determine travel direction vector and sign (+1 or -1) along the corridor
         h_dir = int(self.ap.heading[env_id].item())  # Current travel direction (0..3)
@@ -868,15 +876,48 @@ class Pilot:
                 # Only when the robot is in the bed's half of the corridor: coming along the centreline (0.48 m off
                 # the lane) the usual diagonal approach is safe, and staging there only cost time and steadiness
                 staging = v_now * bed_side > 0.15 and u_now < -1.0
-                if staging:
-                    u_entry = -STAGE_HOLD_U * travel_sign  # Step across near the previous cell's centre
-                    # Get onto the lane by stepping sideways while facing down the corridor (act()'s strafe branch,
-                    # forward speed held near zero): turning toward the point instead swung the robot into a wall on ice
-                    self.strafe[env_id] = True
-                    self.strafe_yaw[env_id] = math.atan2(float(dj), float(di))
-                wp[0] = (tcx + u_entry) if t_axis == 0 else (tcx + v_entry)  # Pre-align waypoint X
-                wp[1] = (tcy + v_entry) if t_axis == 0 else (tcy + u_entry)  # Pre-align waypoint Y
-                speed = min(speed, 0.50)  # Moderate approach speed for accurate pre-alignment
+                # Rough corner cell with the lane on the OUTSIDE of the turn (98% of the line-ups at rough corners in
+                # traced runs): walk the corner as the usual curve, around a corner point moved out to the lane line,
+                # at the rough-floor speed. Stepping sideways while turning on the boxes fell 3 times in 101 such
+                # line-ups in the maze; scripts/corner_lineup_test.py, 1,250 robots each: sideways 4.0% fell / crashed
+                # (most at the lane entry, 0.74 m out), 24% snagged, 7.0 s; this curve 0.2%, 0.6%, 3.7 s. Where the
+                # knees reach a slalom's bed (pelvis u = -1.2) the curve has them 0.42-0.71 m off the centreline (lane
+                # 0.48), the sideways step as little as -0.60. Only with ROUGH_CORNER_CURVE (off): in 11 forced maze
+                # runs it overshot the lane line by 0.2-0.33 m twice (entered fast and still turning after an S-bend)
+                ph = int(self.prev_heading[env_id].item())  # Direction the robot walked into the corner cell
+                in_dir = float(DIRS[ph][0] if t_axis == 1 else DIRS[ph][1])  # ... along the spike corridor's width
+                lane_curve = (
+                    ROUGH_CORNER_CURVE
+                    and ctype == CELL_ROUGH
+                    and (h_dir - ph) % 4 in (1, 3)  # A corner: turned 90 deg in this cell
+                    and bool((self.ap.origin[env_id] == cell).all())  # Still in the corner cell ...
+                    and u_now < -1.0  # ... short of the spike cell
+                    and v_entry * in_dir > 0.0  # Lane on the far side of the corner cell's centre: outside of the turn
+                )
+                if lane_curve:
+                    corner_c = self.ap.centre_of(self.ap.origin[env_id])  # Centre of the corner cell
+                    prev_c = corner_c - self.ap._dirs[ph].float() * self.cell_size  # Centre of the cell before it
+                    across = torch.tensor([1.0, 0.0] if t_axis == 1 else [0.0, 1.0], device=self.device)
+                    entry = wp.clone()
+                    entry[0] = (tcx + u_entry) if t_axis == 0 else (tcx + v_entry)  # Lane entry point (u = -0.75)
+                    entry[1] = (tcy + v_entry) if t_axis == 0 else (tcy + u_entry)
+                    inside = entry + self.ap._dirs[h_dir].float() * 0.75  # On the lane line at the spike cell's centre
+                    bend = corner_c + across * (v_entry - math.copysign(LANE_CURVE_INSET, v_entry))  # Corner point
+                    point = self._polyline_point(pos, [prev_c, bend, entry, inside])
+                    wp = inside if point is None else point
+                    speed = min(speed, LANE_CURVE_SPEED)
+                    lane_curve_on = True
+                else:
+                    if staging:
+                        u_entry = -STAGE_HOLD_U * travel_sign  # Step across near the previous cell's centre
+                        # Get onto the lane by stepping sideways while facing down the corridor (act()'s strafe branch,
+                        # forward speed held near zero): turning toward the point instead swung the robot into a wall
+                        # on ice
+                        self.strafe[env_id] = True
+                        self.strafe_yaw[env_id] = math.atan2(float(dj), float(di))
+                    wp[0] = (tcx + u_entry) if t_axis == 0 else (tcx + v_entry)  # Pre-align waypoint X
+                    wp[1] = (tcy + v_entry) if t_axis == 0 else (tcy + u_entry)  # Pre-align waypoint Y
+                    speed = min(speed, 0.50)  # Moderate approach speed for accurate pre-alignment
 
         # Case 3: Speed adaptation for Trench, Ramp, Ice, and Rough cells
         crossing_trench = False  # Inside a trench cell and not yet clear of the trench (it runs across the centre)
@@ -931,7 +972,8 @@ class Pilot:
                 vy_bias = -0.22 if mean_ry > 0.0 else 0.22  # Sidestep away from the cones
                 speed = min(speed, 0.38)  # Slow forward speed while sidestepping away
 
-        self.on_curve[env_id] = curve and bool(torch.equal(wp, default_wp))  # Curve only if no hazard override
+        # Curve only if no hazard override, or the curve into a spike lane around a rough corner
+        self.on_curve[env_id] = (curve and bool(torch.equal(wp, default_wp))) or lane_curve_on
         return wp, speed, vy_bias  # Return target waypoint (2,), speed limit, and lateral velocity bias
 
     def _pursuit_point(self, env_id: int, pos: torch.Tensor) -> tuple[torch.Tensor, bool]:
@@ -950,7 +992,12 @@ class Pilot:
             return target_c, False
         corner_c = self.ap.centre_of(self.ap.origin[env_id])  # Centre of the corner cell (decision cell)
         prev_c = corner_c - self.ap._dirs[ph].float() * self.cell_size  # Centre of the cell before the corner
-        pts = [prev_c, corner_c, target_c]  # Polyline of the path through the corner
+        point = self._polyline_point(pos, [prev_c, corner_c, target_c])  # Path through the corner
+        return (target_c if point is None else point), True  # Past the end: the target centre
+
+    @staticmethod
+    def _polyline_point(pos: torch.Tensor, pts: list, lookahead: float = PURSUIT_LOOKAHEAD) -> torch.Tensor | None:
+        """Point ``lookahead`` along the polyline ``pts`` past the point closest to ``pos``; None past its end."""
         best_s, best_d, acc = 0.0, 1e9, 0.0  # Arc length of the closest point on the polyline
         for a, b in zip(pts[:-1], pts[1:]):
             seg = b - a
@@ -961,13 +1008,13 @@ class Pilot:
             if d < best_d:
                 best_d, best_s = d, acc + t * length
             acc += length
-        s = best_s + PURSUIT_LOOKAHEAD  # Lookahead arc length
+        s = best_s + lookahead  # Lookahead arc length
         for a, b in zip(pts[:-1], pts[1:]):  # Walk the polyline to arc length s
             length = float(torch.linalg.norm(b - a).item())
             if s <= length:
-                return a + (b - a) * (s / length), True
+                return a + (b - a) * (s / length)
             s -= length
-        return target_c, True  # Past the end: the target centre
+        return None
 
     @staticmethod
     def _side_away_from_cones(pos: torch.Tensor, yaw: float, scan_xy: torch.Tensor, scan_z: torch.Tensor) -> float:
