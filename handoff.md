@@ -15,7 +15,7 @@ Use this file to pick the work up in a new session. The full write-up of methods
 | Route hints (2026-11-08, committed `95c9dc8`) | At a junction, prefer a branch whose next cell shows a hazard only routes carry (or loose boxes): exploring −8% on six extra mazes, no decision changed on 7 of the 8 benchmark mazes (section 3, "Route hints at junctions"). |
 | Slalom sweep 2 + ramp classifier (2026-11-08, committed `040977b`) | 36 more level 9 mazes on the forced short route: **31 slalom crossings, 0 spike hits** (38 / 38 with the first sweep). Of the 6 falls elsewhere, 2 were steep ramps taken for a slalom and 1 a turn on the spot that rotated the long way inside a spike lane; fixed (ramp evidence per half, smooth-slope test, rotation sign re-chosen). Offline audit over the 44 sweep runs: no spike cell ever called a ramp, ramps misread as spike cells 69 s → 0.1 s. Benchmark 648.8 / 647.7 s (without the smooth-slope test) and 765.9 / 649.8 s (final); its falls and resets (L9 seed 2's trench, sideways staging on rough floor, L7 seed 2's 10 s stuck check) were traced to known problems, none to these changes (section 3, "Slalom sweep 2: ramps taken for spike cells, turn direction"). |
 | Stuck guard walks on through (2026-11-08, committed `040977b`) | On the way back from a dead end toward the last 10 s check's spot (L7 seed 2's two resets), `_stuck_guard` now keeps walking through the spot at the commanded speed when that is predicted to end farther than stopping / backing, only facing the travel direction, on plain / rough floor and never into a wall or hazard cell. Benchmark 647.8 / 644.6 s, 0 falls or resets (first version 651.3 / 769.0 s; the 3 falls were L9 seed 2's trench and ice turns, guard idle). 16 L7 seed 2 runs, 0 resets, but the deep snag did not recur, so the new branch is checked by tests only (section 3, "Stuck guard: walk on through"). |
-| Rough-corner line-up (2026-11-09/10, in the working tree, **off**) | Lining up for a spike cell right after a rough corner (sideways step while turning) falls in ~3% of such corners. A curve around a corner point 0.20 m inside the lane line (`LANE_CURVE_INSET`), at the rough-floor speed, instead: `scripts/corner_lineup_test.py` 4.0% → 0.2% falls, 3 s faster, S-bend run-in included. With it on (run snapshots): benchmark **660.5 s (1 fall: an ice turn, unrelated) / 640.4 s, 0 falls**; 12 curves in the maze, 0 falls, incl. the two corners that failed with the first version. Still behind `ROUGH_CORNER_CURVE = False` until switched on (section 3, "Rough-corner line-up"). |
+| Rough-corner line-up (2026-11-09/10, in the working tree, **on**) | Lining up for a spike cell right after a rough corner (sideways step while turning) falls in ~3% of such corners. A curve around a corner point 0.20 m inside the lane line (`LANE_CURVE_INSET`), at the rough-floor speed, instead: `scripts/corner_lineup_test.py` 4.0% → 0.2% falls, 3 s faster, S-bend run-in included. With it on (run snapshots): benchmark **660.5 s (1 fall: an ice turn, unrelated) / 640.4 s, 0 falls**; 25 curves in the maze, 0 falls (9 more forced runs on 2026-11-11, 9 slalom crossings, 0 hits), incl. the two corners that failed with the first version. **Switched on** 2026-11-10 (`ROUGH_CORNER_CURVE = True`; `False` brings back the sideways step) (section 3, "Rough-corner line-up"). |
 | Tests | `uv run pytest tests`: **121 pass** (no simulator needed). |
 | Git | Branch `side-test`. Everything through the slalom sweep 2 fixes and the stuck guard is committed (`git log` for the latest commit; `tools/` and `logs/` are git-ignored, so the checkpoint is not in git). Ask before committing. |
 | Submission | Upload `model_8497.pt` as `policy.pt` plus `pilot.py`. `PILOT_MODE` already defaults to `short` (the runner sets no env vars). |
@@ -872,7 +872,7 @@ every guard episode per 10 s check, `uv run python guard_report.py <trace.csv> .
 `C:\Users\user\AppData\Local\Temp\claude\746074aed36627eb\68de3be3-5f37-4a3b-9bfe-a4792e8b4966\scratchpad\guard\`
 (`v2\` = final code).
 
-### Rough-corner line-up: sideways step vs a curve (2026-11-09/10, in the working tree, off by default)
+### Rough-corner line-up: sideways step vs a curve (2026-11-09/10, in the working tree, on since 2026-11-10)
 
 **Problem.** Before a spike lane / slalom whose free lane is not straight ahead, the pilot lines up by stepping
 sideways while turning to face the corridor (staging, `STAGE_HOLD_U`). Over the traced runs since 2026-11-07
@@ -911,7 +911,7 @@ cell, lane on the outside; `_polyline_point` factored out of `_pursuit_point`), 
 | Forced short route, 11 runs (L9 seeds 1, 11, 24, 44 / 21 / 48 random ends, L7 seed 3) | 3 falls. L7 seed 3: an ice turn sliding back into a spike lane (unrelated). **L9 seed 11 run b:** an S-bend ((0, 7) → (1, 7) → (1, 6)), the robot entered the rough corner (1, 6) at 0.9 m/s still turning, the curve only bends 1 m before the moved corner point, it ran 0.33 m past the lane line (0.81 m off the centreline) and an arm hit the wall. **L9 seed 24 run b:** 0.22 m past the lane into the slalom (2, 5), stage 1 steered back over 0.9 m and left it 35° askew when stage 2 stepped across the gap: spike hit. Run a of both was clean (overshoot 0.14 m). |
 
 So in the maze the curve overshoots outward more than in the test (straight 4 m run-ins only): **2 failures in about
-two dozen curve corners**, against ~3% for the sideways step. Kept behind `ROUGH_CORNER_CURVE = False`.
+two dozen curve corners**, against ~3% for the sideways step. So it was kept off (`ROUGH_CORNER_CURVE = False`) at first.
 
 **Second try (2026-11-10): corner point inside the lane line.** `corner_lineup_test.py` got an S-bend run-in
 (`CORNER_SBEND=0.45`: a 0.45 rad/s yaw-rate bias the wrong way in the last 1.2 m before the corner cell, as at L9 seed
@@ -924,8 +924,8 @@ and `curveVVi<cm>` modes (corner point that far inside the lane line). 250 robot
 | **≤ 0.9 m/s, corner 0.20 m inside** | **0.4%** | 0.70 m | 0.37 / **0.48** | 0% | 3.65 s |
 | ≤ 0.7 m/s, corner 0.15 m inside | 0% | 0.63 m | 0.31 / 0.46 | 6.4% | 4.42 s |
 
-`LANE_CURVE_INSET = 0.20`, `LANE_CURVE_SPEED = 0.9` (still behind `ROUGH_CORNER_CURVE = False`). Maze runs with the flag
-on (run snapshots only), 2026-11-10:
+`LANE_CURVE_INSET = 0.20`, `LANE_CURVE_SPEED = 0.9`. Maze runs with the curve on, 2026-11-10 (then switched on by
+default, `ROUGH_CORNER_CURVE = True`):
 
 | Runs | Result |
 |---|---|
@@ -934,7 +934,15 @@ on (run snapshots only), 2026-11-10:
 | Benchmark set 2 | L9 seed 2 86.7, L9 seed 5 random ends 82.1, L7 seed 4 random ends 44.0, L9 seed 3 88.1, L7 seed 1 59.5, L7 seed 2 85.4, L7 seed 3 78.2, L9 seed 1 116.4: **640.4 s, 0 falls** (committed pilot: 647.8 / 644.6 s; bar 638.7 / 641.0 s) |
 
 The curve ran 12 times in these runs (L9 seed 2, L7 seed 4 random ends, the forced mazes), 0 falls within 4 s of one; no
-sideways line-up on rough floor happened. Faster where it ran: L9 seed 2 83.9 / 86.7 s (89.4–89.9 before), L7 seed 4
+sideways line-up on rough floor happened.
+
+**Check with the curve on by default (2026-11-11):** 9 more forced short-route runs of mazes whose slalom is entered
+from a rough corner with the lane outside: L9 seed 24 × 3 (84.4 / 84.4 / 87.2 s), seed 1 × 2 (109.9 / 113.3), seeds
+7, 17, 40, 42 (105.8, 80.4, 88.4, 127.3 s). **0 falls; 9 slalom crossings, 0 spike hits** (nearest 0.29–0.34 m, as
+before); 13 curves, entering the next cell 0.39–0.66 m off its centreline (lane 0.48, wall face 0.925), heading within
+−15° to +5° (scratchpad `curve_check.py`). Seed 24's slalom corner, reached in only 1 of 2 runs before, was clean in
+3 of 3. In total **25 curves in the maze, 0 falls**. Where comparable, as fast or faster than the sideways step:
+seed 24 84–87 s (92.3 in sweep 2), seed 1 110–113 s (112–116), seed 17 80.4 s (86.6). Faster where it ran: L9 seed 2 83.9 / 86.7 s (89.4–89.9 before), L7 seed 4
 random ends 44.3 / 44.0 s (47.0–47.5).
 
 ## 4. Gotchas learned the hard way
@@ -989,9 +997,9 @@ random ends 44.3 / 44.0 s (47.0–47.5).
 1. **Snags on rough floor** (a foot caught on a loose box): L7 seed 2 corner (3, 5) snags in every run, about 2 s,
    and sometimes falls. L9 seed 5 snags before its slalom. See item 7. **Lining up sideways at a rough corner before a
    spike cell falls in ~3% of those corners** (4.0% of robots in `scripts/corner_lineup_test.py`). A curve instead
-   (`ROUGH_CORNER_CURVE`, off; corner point 0.20 m inside the lane, `LANE_CURVE_INSET`) passed the test, the forced
-   runs and a 2 × 8 benchmark (660.5 s with 1 unrelated ice-turn fall / 640.4 s, 0 falls) on 2026-11-10; switch it on
-   to use it (section 3, "Rough-corner line-up"). The rough-floor test (section 3) says slower
+   (`ROUGH_CORNER_CURVE`, **on** since 2026-11-10; corner point 0.20 m inside the lane, `LANE_CURVE_INSET`) passed the
+   test, the forced runs and a 2 × 8 benchmark (660.5 s with 1 unrelated ice-turn fall / 640.4 s, 0 falls); 25 curves
+   in the maze, 0 falls, L9 seed 24's slalom corner clean 3 of 3 on 2026-11-11 (section 3, "Rough-corner line-up"). The rough-floor test (section 3) says slower
    is worse: 20–28% of robots snag at the pilot's 0.68 m/s, 4–8% at 0.9 m/s with no falls. `ROUGH_SPEED = 0.9` in the
    maze (section 3, "Rough floor at 0.9 m/s in the maze"), with the follow-up fixes for rough corners into ice, the
    trench approach and the stuck guard: 638.7 / 641.0 s, 0 falls (section 3, "Rough corners into ice, trench

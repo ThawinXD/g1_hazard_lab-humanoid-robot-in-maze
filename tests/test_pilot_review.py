@@ -848,9 +848,8 @@ def test_rough_corner_into_outside_lane_is_walked_as_a_curve(monkeypatch):
     rough corners (level 9 seed 11 back into a trench, seed 2 and seed 3 into walls); scripts/corner_lineup_test.py:
     3.9% of 750 robots fell or crashed, against 0.1% walking the corner as a curve around a corner point moved out to
     the lane at the rough-floor speed. A robot that follows the commands must not step sideways, must keep a brisk
-    pace, and must be in the lane, clear of the outer wall, where its knees reach the bed (pelvis u = -1.2).
-    (ROUGH_CORNER_CURVE is off by default: in the maze the curve overshot the lane after an S-bend.)"""
-    monkeypatch.setattr(pilot_module, "ROUGH_CORNER_CURVE", True)
+    pace, and must be in the lane, clear of the outer wall, where its knees reach the bed (pelvis u = -1.2)."""
+    assert pilot_module.ROUGH_CORNER_CURVE, "setup: the rough-corner curve is on by default"
     p = _rough_corner_into_spike_lane(monkeypatch, 0.48)
     pos, yaw = [3.1, 0.0], 0.0  # Just into the corner cell, walking east at the rough-floor speed
     p.ap.cmd[0] = torch.tensor([ROUGH_SPEED, 0.0, 0.0])
@@ -877,12 +876,13 @@ def test_rough_corner_into_outside_lane_is_walked_as_a_curve(monkeypatch):
     assert x_max - 4.0 < 0.70, f"swung {x_max - 4.0:.2f} m off the centreline toward the outer wall"
 
 
-def test_rough_corner_curve_is_off_by_default(monkeypatch):
-    """With ROUGH_CORNER_CURVE off (the default) the rough corner keeps the sideways line-up of commit 040977b."""
+def test_rough_corner_curve_switched_off_keeps_the_sideways_line_up(monkeypatch):
+    """With ROUGH_CORNER_CURVE switched off the rough corner falls back to the sideways line-up of commit 040977b."""
+    monkeypatch.setattr(pilot_module, "ROUGH_CORNER_CURVE", False)
     p = _rough_corner_into_spike_lane(monkeypatch, 0.48)
     xy, pos = _grid(3.1, 0.0), torch.tensor([3.1, 0.0])
     p._compute_waypoint_and_speed(0, pos, 0.0, torch.tensor([2, 0]), xy, torch.zeros(len(xy)))
-    assert bool(p.strafe[0]) and not bool(p.on_curve[0]), "rough-corner curve active by default"
+    assert bool(p.strafe[0]) and not bool(p.on_curve[0]), "curve used although switched off"
 
 
 def test_rough_corner_into_inside_lane_keeps_the_usual_approach(monkeypatch):

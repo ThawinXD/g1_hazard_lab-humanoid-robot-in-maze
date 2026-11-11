@@ -54,9 +54,10 @@ SLALOM_HOLD_U = -0.10  # Pelvis position along the corridor [m] while strafing a
 STAGE_HOLD_U = 1.9  # Lining up sideways for a spike cell ahead: hold this far before its centre [m] (near the
 # previous cell's centre; at 1.4 the robot crept 0.5 m forward while stepping, ended 0.57 m before a slalom bed still in
 # line with it, and the turn toward the lane put a foot on the bed's corner: forced short route, L9 seed 1, 3 of 3 runs)
-ROUGH_CORNER_CURVE = False  # After a rough corner with the lane on the outside, line up with a curve instead of the
-# sideways step (Case 2). OFF: better in scripts/corner_lineup_test.py, but in the maze it overshot past the lane line
-# into a wall after an S-bend (level 9 seed 11) and into a slalom 35 deg askew (seed 24); handoff.md section 3
+ROUGH_CORNER_CURVE = True  # After a rough corner with the lane on the outside, line up with a curve instead of the
+# sideways step (Case 2). Benchmark with it 660.5 s (1 ice-turn fall, unrelated) / 640.4 s, 0 falls; 12 curves in the
+# maze, 0 falls (handoff.md section 3, "Rough-corner line-up"). With the corner point on the lane line (inset 0) it had
+# overshot into a wall after an S-bend (level 9 seed 11) and into a slalom 35 deg askew (seed 24)
 LANE_CURVE_INSET = 0.20  # That curve bends around a corner point this far inside the lane line [m] (0 overshot:
 # corner_lineup_test.py with an S-bend run-in, 250 robots: 5.2% passed 0.70 m off the centreline toward the wall at 0,
 # 0.4% at 0.20, median 0.48 = the lane where the knees reach a slalom bed, at least 0.37 there; no falls, no snags) ...
@@ -882,8 +883,9 @@ class Pilot:
                 # line-ups in the maze; scripts/corner_lineup_test.py, 1,250 robots each: sideways 4.0% fell / crashed
                 # (most at the lane entry, 0.74 m out), 24% snagged, 7.0 s; this curve 0.2%, 0.6%, 3.7 s. Where the
                 # knees reach a slalom's bed (pelvis u = -1.2) the curve has them 0.42-0.71 m off the centreline (lane
-                # 0.48), the sideways step as little as -0.60. Only with ROUGH_CORNER_CURVE (off): in 11 forced maze
-                # runs it overshot the lane line by 0.2-0.33 m twice (entered fast and still turning after an S-bend)
+                # 0.48), the sideways step as little as -0.60. With the corner point on the lane line it overshot
+                # the lane by 0.2-0.33 m twice in 11 forced maze runs (fast and still turning after an S-bend), hence
+                # LANE_CURVE_INSET. Switch: ROUGH_CORNER_CURVE
                 ph = int(self.prev_heading[env_id].item())  # Direction the robot walked into the corner cell
                 in_dir = float(DIRS[ph][0] if t_axis == 1 else DIRS[ph][1])  # ... along the spike corridor's width
                 lane_curve = (
