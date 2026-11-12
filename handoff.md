@@ -18,6 +18,7 @@ Use this file to pick the work up in a new session. The full write-up of methods
 | Rough-corner line-up (2026-11-09/10, in the working tree, **on**) | Lining up for a spike cell right after a rough corner (sideways step while turning) falls in ~3% of such corners. A curve around a corner point 0.20 m inside the lane line (`LANE_CURVE_INSET`), at the rough-floor speed, instead: `scripts/corner_lineup_test.py` 4.0% → 0.2% falls, 3 s faster, S-bend run-in included. With it on (run snapshots): benchmark **660.5 s (1 fall: an ice turn, unrelated) / 640.4 s, 0 falls**; 25 curves in the maze, 0 falls (9 more forced runs on 2026-11-11, 9 slalom crossings, 0 hits), incl. the two corners that failed with the first version. **Switched on** 2026-11-10 (`ROUGH_CORNER_CURVE = True`; `False` brings back the sideways step) (section 3, "Rough-corner line-up"). |
 | Ice turns after a spike lane (2026-11-11, tried and **reverted**) | Turns on the spot on ice right after a spike lane fall in ~17% of those corners when the lane is on the outside of the turn (4 of 24; 1 of 274 after other cells). Slowing to 0.25 m/s out of the lane removed the falls in `scripts/ice_turn_test.py` (new spike-lane approaches) but not in the maze (3 of 15, the slow robot steered 15–46° toward the cell centre before the ice), so `pilot.py` is unchanged (`5c4d99d`). Still the main open fall risk (section 3, "Ice turns after a spike lane"; section 5, item 1). |
 | **Freeze check (2026-11-11)** | Committed `pilot.py` (`5c4d99d`, rough-corner curve on) + `model_8497`, run like the server (no env vars): benchmark **633.3 s (1 fall) / 684.6 s (2 falls)**; 6 unseen level 9 random-ends mazes (seeds 61, 63–67) **all goal, 0 falls** (76.7–122.4 s). The 3 falls were known types, none from the latest changes: L7 seed 3 walking straight across the ice (6, 3) right after a spike lane (section 5, item 0), L7 seed 2's 10 s stuck check after a snag in (4, 0) (cost ~3 s), L9 seed 5 random ends turning back on the spot in the rough cell (5, 5). Server checks pass (`check_policy`, `check_python`, `tests/test_challenge_upload.py`); upload files ready in `logs/submission/` (git-ignored). |
+| **Cruise speed 1.1 (2026-11-12)** | `PILOT_SPEED` default 1.0 → 1.1 in `pilot.py` (hazard speed caps unchanged; the env var still overrides). 8-maze benchmark at 1.1: **630.3 / 632.7 / 633.0 / 642.4 s, 0 falls in 32 maze runs**; 1.0 controls the same day 683.2 / 673.0 s with 1 fall each, ≈ 642 s without the falls, so ~8 s (1%) faster per set. 6 unseen level 9 random-ends mazes: 632.3 s with 1 fall (seed 66, the known ice turn after a slalom) against 577.7 s, 0 falls at 1.0; the other 5 mazes 490.9 vs 496.4 s. Every fall on both sides was at a hazard whose speed cap (≤ 0.9) applies at either cruise speed. 1.2 tried and dropped: 621.0 / 819.9 s, 0 / 2 falls (section 3, "Cruise speed 1.1"). |
 | Tests | `uv run pytest tests`: **121 pass** (no simulator needed). |
 | Git | Branch `side-test`. Everything through the slalom sweep 2 fixes and the stuck guard is committed (`git log` for the latest commit; `tools/` and `logs/` are git-ignored, so the checkpoint is not in git). Ask before committing. |
 | Submission | Upload `model_8497.pt` as `policy.pt` plus `pilot.py`. `PILOT_MODE` already defaults to `short` (the runner sets no env vars). |
@@ -990,6 +991,35 @@ L9 seed 2's trench (4, 0); L9 seed 3 at walking pace in the rough corner (8, 4) 
 spot). Next try (not before the freeze): keep the heading straight down the lane until the ice decision (no
 pre-rotation) and only then slow / stop; check it with the maze, not only the test.
 
+### Cruise speed 1.1 (2026-11-12)
+
+`PILOT_SPEED` is the speed limit on clear cells (`self.fast_speed`); every hazard keeps its own cap (trench, steep ramp,
+rough 0.9, low ramp 0.68, ice 0.55, spike lane 0.48), so it only changes plain stretches and corners. Committed pilot
+(`706accc`, `pilot.py` as in `5c4d99d`) with `model_8497`, all runs on the same day, set with the env var:
+
+| Maze | 1.0 (2 runs) | 1.1 (4 runs) | 1.2 (2 runs) |
+|---|---|---|---|
+| L7 seed 1 | 59.0 / 59.2 | 57.9–58.9 | 57.5 / 58.4 |
+| L7 seed 2 | 87.0 / 87.7 | 84.3–87.3 | 83.0 / 84.0 |
+| L7 seed 3 | 79.1 / 111.3 (fall) | 76.3–78.1 | 75.9 / 76.8 |
+| L7 seed 4, random ends | 83.5 (fall) / 44.0 | 43.5–43.8 | 43.6 / 43.2 |
+| L9 seed 1 | 115.5 / 116.3 | 114.0–114.3 | 112.8 / 112.4 |
+| L9 seed 2 | 89.4 / 85.5 | 84.4–88.0 | 83.1 / 145.6 (fall) |
+| L9 seed 3 | 88.2 / 89.0 | 86.1–88.4 | 86.3 / 86.0 |
+| L9 seed 5, random ends | 81.5 / 80.0 | 76.8–87.2 | 78.8 / 213.5 (reset) |
+| **Total** | 683.2 / 673.0 s, 1 / 1 falls | **630.3 / 632.7 / 633.0 / 642.4 s, 0 falls** | 621.0 / 819.9 s, 0 / 2 |
+
+Falls: 1.0 in rough cells, L7 seed 4's rough corner (4, 4) between two spike cells and L7 seed 3's (2, 4); 1.2 L9
+seed 2's trench (4, 0) (section 5, item 1) and a 10 s stuck check in L9 seed 5's (5, 4) that cost ~160 s. Unseen level 9
+random-ends mazes (seeds 61, 63–67): 1.0 75.4 / 123.3 / 80.4 / 113.1 / 81.3 / 104.2 s, 0 falls; 1.1 75.3 / 123.6 /
+82.6 / 109.7 / 141.4 / 99.7 s, 1 fall (seed 66: the turn on the spot on the ice (8, 0) right after the slalom (7, 0),
+section 5, item 0, reached through a trench and a rough cell at their 0.9 caps, so at the same speed either way).
+
+**Adopted 1.1** as the default: no fall that the cruise speed could explain, ~8 s per 8-maze set, and the most even
+times of the three. 1.2's clean run was ~10 s faster still, but it swings much more (621 → 820 s) and its two falls
+came at known weak spots, so it is not worth the risk without more runs. The gain is small because
+most of a maze is spent at hazard caps, corners and turns on the spot (section 3, "Where the time goes").
+
 ## 4. Gotchas learned the hard way
 
 - **Runs vary.** The same seed can differ by 50+ s. Never judge a change from one run.
@@ -1073,7 +1103,7 @@ pre-rotation) and only then slow / stop; check it with the maze, not only the te
    (the generator's public rules: the short route is ≥ 6 cells shorter and its first hard hazard is within 3 cells),
    never the real map.
 3. **Speed tuning** (list in develop.md / the earlier discussion). Raise one at a time and re-run the benchmark:
-   - cruise speed `PILOT_SPEED` 1.0 → 1.2
+   - cruise speed `PILOT_SPEED`: *done 2026-11-12*, default 1.1 (1.2 dropped; section 3, "Cruise speed 1.1")
    - speed limits near hazards: ramp and trench 0.70, rough and low ramp 0.68, ice 0.55, spike lane 0.48
    - `LAT_ACC_MAX` 0.6 → 0.8
 
@@ -1113,11 +1143,12 @@ pre-rotation) and only then slow / stop; check it with the maze, not only the te
 
 ## 6. Before submitting
 
-- [x] `uv run pytest tests` passes (121, 2026-11-11). `test_pilot_passes_server_upload_checks` checks the map-reading ban.
-- [x] 8-maze benchmark, at least 2 runs: 633.3 / 684.6 s on `5c4d99d` (2026-11-11), falls all of known types (section 1,
-      "Freeze check").
+- [x] `uv run pytest tests` passes (121, 2026-11-12). `test_pilot_passes_server_upload_checks` checks the map-reading ban.
+- [x] 8-maze benchmark, at least 2 runs: 630.3 / 632.7 / 633.0 / 642.4 s, 0 falls, with `PILOT_SPEED` 1.1 (2026-11-12,
+      section 1, "Cruise speed 1.1"); before it 633.3 / 684.6 s on `5c4d99d` (section 1, "Freeze check").
 - [x] `PILOT_MODE` default is `short` in `pilot.py`.
 - [x] `scripts/challenge_server.py`'s own `check_policy` / `check_python` accept the files (policy 7.8 MB, limit 60);
       `g1_maze_lab.autopilot`, which `pilot.py` imports, is identical to the course version.
 - [ ] Upload `logs/submission/policy.pt` (= `model_8497.pt`, sha256 `813e3db2…`) and `logs/submission/pilot.py`
-      (= `pilot.py` at `5c4d99d`, sha256 `10e9e7de…`) only. **Not** `tools/`, which reads the real map.
+      (= `pilot.py` with the `PILOT_SPEED` 1.1 default, sha256 `2b9c8e46…`) only. **Not** `tools/`, which reads the
+      real map.

@@ -161,7 +161,7 @@ class Pilot:
         mode = os.environ.get("PILOT_MODE", "short").lower()  # Read route preference mode from env var
         self.cost_table = COSTS_SHORT if mode == "short" else COSTS_AUTO  # Pick cost table for mode
         self.route_hints = mode == "short"  # Steer toward route-only hazards at junctions (auto mode avoids them)
-        self.fast_speed = float(os.environ.get("PILOT_SPEED", 1.0))  # Cruise speed on clear straight cells [m/s]
+        self.fast_speed = float(os.environ.get("PILOT_SPEED", 1.1))  # Cruise speed on clear straight cells [m/s]
         self.safe_lane_offset = 0.48  # Lateral offset [m] placing robot in the middle of the ~0.98 m free lane
 
         # Instantiate the underlying MazeAutopilot for basic grid indexing and wall-scan helpers
@@ -789,7 +789,7 @@ class Pilot:
 
         default_wp, curve = self._pursuit_point(env_id, pos)  # Default waypoint: lookahead point on the cell path
         wp = default_wp.clone()  # Hazard cases below may replace it
-        speed = self.fast_speed  # Default max speed is fast cruise speed (0.85 m/s)
+        speed = self.fast_speed  # Default max speed is fast cruise speed (PILOT_SPEED, 1.1 m/s)
         vy_bias = 0.0  # Default lateral velocity bias is 0.0 m/s
         self.strafe[env_id] = False  # Normal waypoint tracking unless the slalom crossover below turns it on
         lane_curve_on = False  # Curve into a spike lane's entry around a rough corner (Case 2)
