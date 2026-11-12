@@ -83,8 +83,10 @@ checkpoint with the trench / ramp / ice / rough / sideways tests against `model_
   `9` → `G1-Maze-Hard9`), loads the policy and the pilot, enforces the rules (fall / body crash / spike bed / 10 s
   stuck → reset to start, clock keeps running) and prints a `RESULT` line. `DefaultPilot` there defines the pilot
   interface: `Pilot(num_envs, num_cells, cell_size, device, start_cell, goal_cell)`, `act(obs)` returning velocity
-  commands, `reset(env_ids)`. `challenge_server.py` / `challenge_runner.py` are the instructor upload/leaderboard side.
-  **Don't change the rules in these scripts.**
+  commands, `reset(env_ids)`. `challenge_server.py` / `challenge_runner.py` are the instructor upload/leaderboard
+  side: uploads land in `submissions/<team>/policy.pt` (+ optional `pilot.py`), `leaderboard.csv` is appended by
+  `challenge.py --team <team>` (see [submissions/README.md](submissions/README.md)). **Don't change the rules in
+  these scripts.**
 - **Pilot** [pilot.py](pilot.py): one `Pilot` class built on `MazeAutopilot` ([src/g1_maze_lab/autopilot.py](src/g1_maze_lab/autopilot.py)).
   Layers: perception (height scan + lidar wall votes → walls and hazard class per cell), memory kept across resets
   (walls, cell types/costs, death penalties), planning (cost-weighted flood fill to the goal, `COSTS_SHORT` /

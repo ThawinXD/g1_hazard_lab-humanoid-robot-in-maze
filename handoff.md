@@ -16,6 +16,8 @@ Use this file to pick the work up in a new session. The full write-up of methods
 | Slalom sweep 2 + ramp classifier (2026-11-08, committed `040977b`) | 36 more level 9 mazes on the forced short route: **31 slalom crossings, 0 spike hits** (38 / 38 with the first sweep). Of the 6 falls elsewhere, 2 were steep ramps taken for a slalom and 1 a turn on the spot that rotated the long way inside a spike lane; fixed (ramp evidence per half, smooth-slope test, rotation sign re-chosen). Offline audit over the 44 sweep runs: no spike cell ever called a ramp, ramps misread as spike cells 69 s → 0.1 s. Benchmark 648.8 / 647.7 s (without the smooth-slope test) and 765.9 / 649.8 s (final); its falls and resets (L9 seed 2's trench, sideways staging on rough floor, L7 seed 2's 10 s stuck check) were traced to known problems, none to these changes (section 3, "Slalom sweep 2: ramps taken for spike cells, turn direction"). |
 | Stuck guard walks on through (2026-11-08, committed `040977b`) | On the way back from a dead end toward the last 10 s check's spot (L7 seed 2's two resets), `_stuck_guard` now keeps walking through the spot at the commanded speed when that is predicted to end farther than stopping / backing, only facing the travel direction, on plain / rough floor and never into a wall or hazard cell. Benchmark 647.8 / 644.6 s, 0 falls or resets (first version 651.3 / 769.0 s; the 3 falls were L9 seed 2's trench and ice turns, guard idle). 16 L7 seed 2 runs, 0 resets, but the deep snag did not recur, so the new branch is checked by tests only (section 3, "Stuck guard: walk on through"). |
 | Rough-corner line-up (2026-11-09/10, in the working tree, **on**) | Lining up for a spike cell right after a rough corner (sideways step while turning) falls in ~3% of such corners. A curve around a corner point 0.20 m inside the lane line (`LANE_CURVE_INSET`), at the rough-floor speed, instead: `scripts/corner_lineup_test.py` 4.0% → 0.2% falls, 3 s faster, S-bend run-in included. With it on (run snapshots): benchmark **660.5 s (1 fall: an ice turn, unrelated) / 640.4 s, 0 falls**; 25 curves in the maze, 0 falls (9 more forced runs on 2026-11-11, 9 slalom crossings, 0 hits), incl. the two corners that failed with the first version. **Switched on** 2026-11-10 (`ROUGH_CORNER_CURVE = True`; `False` brings back the sideways step) (section 3, "Rough-corner line-up"). |
+| Ice turns after a spike lane (2026-11-11, tried and **reverted**) | Turns on the spot on ice right after a spike lane fall in ~17% of those corners when the lane is on the outside of the turn (4 of 24; 1 of 274 after other cells). Slowing to 0.25 m/s out of the lane removed the falls in `scripts/ice_turn_test.py` (new spike-lane approaches) but not in the maze (3 of 15, the slow robot steered 15–46° toward the cell centre before the ice), so `pilot.py` is unchanged (`5c4d99d`). Still the main open fall risk (section 3, "Ice turns after a spike lane"; section 5, item 1). |
+| **Freeze check (2026-11-11)** | Committed `pilot.py` (`5c4d99d`, rough-corner curve on) + `model_8497`, run like the server (no env vars): benchmark **633.3 s (1 fall) / 684.6 s (2 falls)**; 6 unseen level 9 random-ends mazes (seeds 61, 63–67) **all goal, 0 falls** (76.7–122.4 s). The 3 falls were known types, none from the latest changes: L7 seed 3 walking straight across the ice (6, 3) right after a spike lane (section 5, item 0), L7 seed 2's 10 s stuck check after a snag in (4, 0) (cost ~3 s), L9 seed 5 random ends turning back on the spot in the rough cell (5, 5). Server checks pass (`check_policy`, `check_python`, `tests/test_challenge_upload.py`); upload files ready in `logs/submission/` (git-ignored). |
 | Tests | `uv run pytest tests`: **121 pass** (no simulator needed). |
 | Git | Branch `side-test`. Everything through the slalom sweep 2 fixes and the stuck guard is committed (`git log` for the latest commit; `tools/` and `logs/` are git-ignored, so the checkpoint is not in git). Ask before committing. |
 | Submission | Upload `model_8497.pt` as `policy.pt` plus `pilot.py`. `PILOT_MODE` already defaults to `short` (the runner sets no env vars). |
@@ -945,6 +947,49 @@ before); 13 curves, entering the next cell 0.39–0.66 m off its centreline (lan
 seed 24 84–87 s (92.3 in sweep 2), seed 1 110–113 s (112–116), seed 17 80.4 s (86.6). Faster where it ran: L9 seed 2 83.9 / 86.7 s (89.4–89.9 before), L7 seed 4
 random ends 44.3 / 44.0 s (47.0–47.5).
 
+### Ice turns after a spike lane (2026-11-11, tried and reverted)
+
+**Problem.** The most frequent fall left after the rough-corner fix: turning on the spot on ice right after leaving a
+spike lane (L7 seed 2 (4, 3), L7 seed 3 (1, 3), L9 seed 5 random ends (7, 8) in recent runs). Over the traced runs
+since 2026-11-07 (scratchpad `ice_pivots.py`): ice turns after other cells **1 fall in 274**; after a spike lane /
+slalom **5 in 32**: lane on the outside of the turn 4 / 24, inside 1 / 8 (an older pilot). The robot reaches the ice
+still on the lane line (median 0.48 m off the centreline), often 20–40° yawed toward the turn after a drift in the lane
+and the steer back toward the cell centre, so it brakes on the ice while crabbing; the falls came in pure rotation
+(commands 0, 0, ±0.6), the robot sliding back at 1.0–1.2 m/s into the spike lane, well away from walls (lidar 0.7–0.8 m).
+
+**Policy test** (`scripts/ice_turn_test.py --task G1-Ice-Corner-Test`, new `ICE_APPROACH`: walk the lane line ±0.48 m
+at 0.48 m/s to the bed's end, then as below; brake from the ice edge, rotate 90° at 0.6 rad/s; 500 robots per trial,
+half per side):
+
+| Approach after the bed's end | Outside lane fell | Inside lane fell |
+|---|---|---|
+| `centre` (on the centreline all along; the old test) | 0% (both sides together) | |
+| `lane`: steer for the ice cell's centre at the ice limit (pilot) | 2.2–3.0% | 29–31% |
+| `lane_wait`: as `lane`, stand 1 s before rotating | 3.0% | 29% |
+| `lane_straight`: keep the lane line | 3.6% | 13% |
+| **`lane_slow`: as `lane` at ≤ 0.25 m/s** | **0%** | 20% |
+| `lane_straight_slow` | 0% | 10–23% |
+| `lane_centre`: slowly on to 0.15 m from the centreline | 0% | 41% |
+
+Inside-lane robots mostly fall near the inner corner's wall end (u −0.7…−0.8, v +0.7…+1.0): the test has no wall
+clearance, while the pilot's turn steps away from walls closer than 0.5 m; in the maze the inside case is 0 of 7 with
+current pilots. Keeping the lane line would also move the turn toward the middle of the ice (the early decision needs
+the robot within 0.45 m of the centreline).
+
+**Tried:** decided in a spike cell with the ice cell as target, from 0.22 m before the ice cell's border (the bed's
+end) and on the ice until the ice cell's decision, at most 0.25 m/s (steering unchanged); test
+`test_out_of_a_spike_lane_onto_ice_slowly`.
+
+**Maze runs** (with the rough-corner curve on): L7 seed 2's (4, 3) corner fell 2 times in 5 (one a spike hit after
+sliding back into the lane), L9 seed 15's (8, 2) 1 in 2; L7 seed 3 (1, 3) × 2, L9 seed 13 (8, 6) × 2 and two
+inside-lane corners clean. Ice turns after a spike lane, outside lane: **3 of 15** (before: 4 of 24). At 0.25 m/s the
+pilot's normal steering toward the ice cell's centre turned the robot 0.5–0.9 rad/s at the lane's end, so it reached the
+ice 15° (median; up to 46°) rotated instead of 4°, started its turn 0.0–0.16 m past the ice edge and slid back over it;
+the test robots stop and turn without that pre-rotation. **Reverted** (pilot.py = `5c4d99d`). Other falls in these runs:
+L9 seed 2's trench (4, 0); L9 seed 3 at walking pace in the rough corner (8, 4) before an inside spike lane (the known
+spot). Next try (not before the freeze): keep the heading straight down the lane until the ice decision (no
+pre-rotation) and only then slow / stop; check it with the maze, not only the test.
+
 ## 4. Gotchas learned the hard way
 
 - **Runs vary.** The same seed can differ by 50+ s. Never judge a change from one run.
@@ -993,6 +1038,12 @@ random ends 44.3 / 44.0 s (47.0–47.5).
   Reverted.
 
 ## 5. Open problems and next steps (in priority order)
+
+0. **Ice turns on the spot right after a spike lane** (lane on the outside of the turn): ~17–20% of those corners fall
+   (4 of 24, then 3 of 15), the robot sliding back over the ice edge into the lane while rotating; after any other
+   cell 1 in 274. The most frequent fall left (L7 seed 2's (4, 3) is in the benchmark). Slowing the exit to 0.25 m/s
+   was tried and reverted on 2026-11-11 (section 3, "Ice turns after a spike lane"); next: no pre-rotation before the
+   ice (hold the corridor heading to the ice cell's decision), judged in the maze.
 
 1. **Snags on rough floor** (a foot caught on a loose box): L7 seed 2 corner (3, 5) snags in every run, about 2 s,
    and sometimes falls. L9 seed 5 snags before its slalom. See item 7. **Lining up sideways at a rough corner before a
@@ -1062,7 +1113,11 @@ random ends 44.3 / 44.0 s (47.0–47.5).
 
 ## 6. Before submitting
 
-- [ ] `uv run pytest tests` passes. `test_pilot_passes_server_upload_checks` checks the map-reading ban.
-- [ ] 8-maze benchmark, at least 2 runs, no new falls compared with the table above.
-- [ ] `PILOT_MODE` default is `short` in `pilot.py`.
-- [ ] Upload `model_8497.pt` (as `policy.pt`) and `pilot.py` only. **Not** `tools/`, which reads the real map.
+- [x] `uv run pytest tests` passes (121, 2026-11-11). `test_pilot_passes_server_upload_checks` checks the map-reading ban.
+- [x] 8-maze benchmark, at least 2 runs: 633.3 / 684.6 s on `5c4d99d` (2026-11-11), falls all of known types (section 1,
+      "Freeze check").
+- [x] `PILOT_MODE` default is `short` in `pilot.py`.
+- [x] `scripts/challenge_server.py`'s own `check_policy` / `check_python` accept the files (policy 7.8 MB, limit 60);
+      `g1_maze_lab.autopilot`, which `pilot.py` imports, is identical to the course version.
+- [ ] Upload `logs/submission/policy.pt` (= `model_8497.pt`, sha256 `813e3db2…`) and `logs/submission/pilot.py`
+      (= `pilot.py` at `5c4d99d`, sha256 `10e9e7de…`) only. **Not** `tools/`, which reads the real map.

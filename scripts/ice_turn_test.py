@@ -31,6 +31,15 @@ Env vars:
     ICE_BRAKE    braking deceleration [m/s^2] (default 0.6, PIVOT_BRAKE_ACC_ICE)
     ICE_BRAKE_U  start braking this far before the ice cell's centre [m] (default 1.0)
     ICE_REPEATS  trials per rate (default 2)
+    ICE_APPROACH approaches to compare, comma-separated (default "centre"): ``centre`` walks in on the centreline
+                 (+-0.1); the ``lane*`` ones come out of a spike lane like pilot.py: on the lane line 0.48 m off the
+                 centreline (half the robots each side; + = inside of the left turn) at the lane speed 0.48 until the
+                 bed's end (1.22 m before the ice cell's centre), then ``lane`` steers for the ice cell's centre
+                 (normal tracking at <= ICE_SPEED), ``lane_straight`` keeps the lane line, ``lane_slow`` /
+                 ``lane_straight_slow`` do the same at <= 0.25 m/s (pilot.py's ICE_FROM_SPIKE_SPEED), ``lane_wait``
+                 stands 1 s before rotating, ``lane_centre`` walks slowly on until 0.15 m from the centreline.
+                 Per lane side it prints the falls and where they happened. No wall clearance as in pilot.py's turn
+                 (inside-lane robots touch the inner corner's wall end)
 """
 
 import math
@@ -53,6 +62,8 @@ SPEED = float(os.environ.get("ICE_SPEED", 0.55))
 BRAKE = float(os.environ.get("ICE_BRAKE", 0.6))
 BRAKE_U = float(os.environ.get("ICE_BRAKE_U", 1.0))
 REPEATS = int(os.environ.get("ICE_REPEATS", 2))
+APPROACHES = os.environ.get("ICE_APPROACH", "centre").split(",")
+LANE, LANE_SPEED, BED_END, SLOW = 0.48, 0.48, 1.22, 0.25  # pilot.py lane offset / speed; bed's end before the centre
 LOOKAHEAD = 1.0  # pilot.py PURSUIT_LOOKAHEAD [m]
 MAX_ACC, MAX_ANG_ACC, MAX_TURN = 2.0, 2.8, 1.1  # pilot.py ap.max_acc [m/s^2], ap.max_ang_acc, ap.max_turn
 ICE_ACC, ICE_TURN = 0.6, 0.65  # pilot.py: acceleration and tracking yaw-rate limits on ice
@@ -93,7 +104,7 @@ def _assign_rows(env):
     return ids % rows
 
 
-def _trial(env, step, rate, dt, start, turn, corner):
+def _trial(env, step, rate, dt, start, turn, corner, approach="centre"):
     """One trial; ``turn`` (n,) signed turn angle per robot [rad], ``corner`` walk out north after a left turn."""
     robot = env.scene["robot"]
     cmd = env.command_manager.get_term("base_velocity")
@@ -105,7 +116,11 @@ def _trial(env, step, rate, dt, start, turn, corner):
 
     pose = robot.data.default_root_pose.torch.clone()
     pose[:, 0] = ice_x - start
-    pose[:, 1] = centre_y + (torch.rand(n, device=dev) * 2.0 - 1.0) * LATERAL
+    lane_v = torch.where(torch.arange(n, device=dev) % 2 == 0, LANE, -LANE)  # Lane line per robot (lane approaches)
+    if approach == "centre":
+        pose[:, 1] = centre_y + (torch.rand(n, device=dev) * 2.0 - 1.0) * LATERAL
+    else:
+        pose[:, 1] = centre_y + lane_v
     pose[:, 2] += origins[:, 2]
     pose[:, 3:7] = torch.tensor([0.0, 0.0, 0.0, 1.0], device=dev)
     robot.write_root_pose_to_sim_index(root_pose=pose)
@@ -120,6 +135,7 @@ def _trial(env, step, rate, dt, start, turn, corner):
     t_rot = torch.full((n,), float("nan"), device=dev)
     prev_yaw = _yaw(robot.data.root_quat_w.torch)
     active = torch.ones(n, dtype=torch.bool, device=dev)
+    fall_at = torch.full((n, 3), float("nan"), device=dev)  # (u, v, lane side) where a robot fell
     for _ in range(int(TRIAL / dt)):
         pos = robot.data.root_pos_w.torch
         yaw = _yaw(robot.data.root_quat_w.torch)
@@ -129,8 +145,12 @@ def _trial(env, step, rate, dt, start, turn, corner):
 
         # Phase changes
         go = (phase == 0) & (u > -BRAKE_U)
+        if approach == "lane_centre":  # Walk on (slowly, steering for the centre) until near the centreline
+            go = (phase == 0) & (u > -BRAKE_U) & ((v.abs() < 0.15) | (u > -0.2))
         phase[go], t_phase[go] = 1, 0.0
-        go = (phase == 1) & (((command[:, 0].abs() < 0.05) & (speed_b < 0.15)) | (t_phase > 1.5))
+        settle = 1.0 if approach == "lane_wait" else 0.0  # Stand this long after stopping, before rotating
+        stopped = (command[:, 0].abs() < 0.05) & (speed_b < 0.15)
+        go = (phase == 1) & ((stopped & (t_phase > settle)) | (t_phase > 1.5 + settle))
         target[go] = _wrap(yaw[go] + turn[go])
         phase[go], t_phase[go] = 2, 0.0
         err = _wrap(target - yaw)
@@ -148,10 +168,19 @@ def _trial(env, step, rate, dt, start, turn, corner):
         w_lim = torch.where(on_ice, ICE_TURN, MAX_TURN)
         walk_in, walk_out = phase == 0, phase == 3
         head_in = _wrap(torch.atan2(-v, torch.full_like(v, LOOKAHEAD)) - yaw)  # Pursuit along the entry corridor
+        speed_in = torch.full_like(v, SPEED)
+        if approach != "centre":
+            in_lane = u < -BED_END
+            on_line = _wrap(torch.atan2(lane_v - v, torch.full_like(v, LOOKAHEAD)) - yaw)  # Along the lane line
+            to_centre = _wrap(torch.atan2(-v, -u) - yaw)  # Steer for the ice cell's centre
+            after = on_line if "straight" in approach else to_centre
+            head_in = torch.where(in_lane, on_line, after)
+            v_after = SLOW if ("slow" in approach or approach == "lane_centre") else SPEED
+            speed_in = torch.where(in_lane, torch.full_like(v, LANE_SPEED), torch.full_like(v, v_after))
         head_out = _wrap(torch.atan2(torch.full_like(u, LOOKAHEAD), -u) - yaw)  # ... and north along the exit one
         head = torch.where(walk_out, head_out, head_in)
         walking = walk_in | walk_out
-        v_des = SPEED * torch.cos(head).clamp(min=0.0) ** 2
+        v_des = torch.where(walk_in, speed_in, torch.full_like(speed_in, SPEED)) * torch.cos(head).clamp(min=0.0) ** 2
         new[walking, 0] = command[walking, 0] + (v_des - command[:, 0])[walking].clamp(
             -lim_acc[walking], lim_acc[walking]
         )
@@ -180,10 +209,11 @@ def _trial(env, step, rate, dt, start, turn, corner):
         t_phase += dt
         terminated = active & env.termination_manager.terminated
         fell[terminated] = phase[terminated].clamp(max=DONE - 1)
+        fall_at[terminated] = torch.stack((u, v, lane_v), -1)[terminated]
         active &= ~terminated & (phase < DONE)
         if not bool(active.any()):
             break
-    return fell, phase, spun, t_rot
+    return fell, phase, spun, t_rot, fall_at, lane_v
 
 
 def _pct(k, n):
@@ -213,9 +243,9 @@ def ice_playback(step, *, dt, args_cli, env_cfg):
         f"{BRAKE} m/s^2 from {BRAKE_U} m before the ice cell's centre, {REPEATS} trial(s) per rate",
         flush=True,
     )
-    for rate in RATES:
-        rows = [_trial(env, step, rate, dt, sub.start_distance, turn, corner) for _ in range(REPEATS)]
-        fell, phase, spun, t_rot = (torch.cat([r[i] for r in rows]) for i in range(4))
+    for rate, approach in [(r, a) for a in APPROACHES for r in RATES]:
+        rows = [_trial(env, step, rate, dt, sub.start_distance, turn, corner, approach) for _ in range(REPEATS)]
+        fell, phase, spun, t_rot, fall_at, lane_v = (torch.cat([r[i] for r in rows]) for i in range(6))
         g = groups.repeat(REPEATS)
         print(f"\n[ICE] rotation rate {rate:.2f} rad/s", flush=True)
         print(
@@ -237,6 +267,17 @@ def ice_playback(step, *, dt, args_cli, env_cfg):
                 f"{_pct(n - done - n_fell, n):>9}{_pct(int(spun[sel].sum()), n):>8}{tr_s:>9}",
                 flush=True,
             )
+        if approach != "centre":  # By lane side (+ = inside of the left turn)
+            for side, name in ((LANE, "inside"), (-LANE, "outside")):
+                sel = lane_v == side
+                n, f = int(sel.sum()), fell[sel]
+                fa = fall_at[sel & (fell >= 0)]
+                spots = ", ".join(f"({a:+.2f},{b:+.2f})" for a, b, _ in fa[:8].tolist())
+                print(
+                    f"{'':6}{name:>8} lane: {_pct(int((f >= 0).sum()), n)} fell, rotate {int((f == 2).sum())}; "
+                    f"at (u, v): {spots}",
+                    flush=True,
+                )
 
 
 play_rsl_rl.run_playback = ice_playback
