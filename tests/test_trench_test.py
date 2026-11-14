@@ -165,6 +165,26 @@ def test_rough_corridor_lanes_are_free_and_walled():
         assert _top_z(meshes, [origin[:2]])[0] == 0.0, f"{kind}: box under the spawn point"
 
 
+def test_rough_corridor_bare_cells_are_flat():
+    """bare_cells (G1-Corner-Test): the cells before and after the corner hold no boxes, the corner cell keeps its
+    boxes and the walls are unchanged."""
+    kinds = ("left", "right")
+    for kind in kinds:
+        diff = (kinds.index(kind) + 0.5) / len(kinds)
+        cfg = RoughCorridorTerrainCfg(size=(8.0, 8.0), kinds=kinds, bare_cells=("before", "after"))
+        meshes, origin = rough_corridor_terrain(diff, cfg)
+        full, _ = rough_corridor_terrain(diff, RoughCorridorTerrainCfg(size=(8.0, 8.0), kinds=kinds))
+        path = np.array(rough_path(kind, cfg)) + origin[:2]
+        c = path[1]
+        u2 = (path[2] - c) / np.linalg.norm(path[2] - c)
+        boxes = [m.bounds.mean(axis=0)[:2] for m in meshes if 0.0 < m.bounds[1][2] <= 0.08 + 1e-6]
+        for name, q in (("before", c - [2.0, 0.0]), ("after", c + 2.0 * u2)):
+            assert all(np.abs(b - q).max() > 1.0 for b in boxes), f"{kind}: box in the {name} cell"
+        assert sum(np.abs(b - c).max() < 1.0 for b in boxes) > 0, f"{kind}: no boxes in the corner cell"
+        walls = sorted(tuple(np.round(m.bounds.ravel(), 6)) for m in meshes if np.isclose(m.bounds[1][2], 1.0))
+        assert walls == sorted(tuple(np.round(m.bounds.ravel(), 6)) for m in full if np.isclose(m.bounds[1][2], 1.0))
+
+
 def test_rough_corridor_kinds_and_boxes():
     """Straight / lineup are the same straight corridor, right's walls are left's mirrored in y; every cell holds the
     maze's loose boxes (at most 10 per 2 m cell, 2-8 cm high)."""

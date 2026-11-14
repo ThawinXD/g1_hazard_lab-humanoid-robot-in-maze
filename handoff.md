@@ -1021,6 +1021,39 @@ times of the three. 1.2's clean run was ~10 s faster still, but it swings much m
 came at known weak spots, so it is not worth the risk without more runs. The gain is small because
 most of a maze is spent at hazard caps, corners and turns on the spot (section 3, "Where the time goes").
 
+### Rough corners next to spike cells (2026-11-13, test only, pilot.py unchanged)
+
+**How common.** 13 logged mazes (8 benchmark + 6 unseen, both routes; `tools/spike_corners.py <challenge logs>`): 37 rough
+corners next to a spike cell. Spike lane after the corner with the lane on the outside 9, on the **inside** 9, slalom
+5; leaving a spike lane straight into a rough corner 16; both, 2 (L7 seed 4 random ends (4, 4), L9 seed 61 (7, 1)).
+The "98% outside" in "Rough-corner line-up" counted sideways line-ups; an inside lane rarely needs one.
+
+**Test.** `scripts/corner_lineup_test.py` extended and moved to a new task `G1-Corner-Test` (rough L corners, all 500
+robots, the cells before and after the corner flat like spike cells: with boxes there, robots walking the lane at
+0.48 m/s on them fell 24%, an artifact). New: `CORNER_LANE=inside`; robots walk on through the whole bed as pilot.py's
+Case 1 and a SPIKE is challenge.py's rule (any body below 0.37 m in the bed; bed edge 0-0.10 m short of the
+centreline); pilot.py's cone shield mirrored (`CORNER_SHIELD=0` turns it off); `CORNER_RUNIN=±0.48` makes the cell
+before the corner a spike lane walked like pilot.py (Case 2 to the entry, then Case 1). Falls / hits are listed per cell
+and turn direction. `model_8497`, 1,000 corners each:
+
+| Case (pilot.py's maneuver) | Through | Spike | Fell / crashed |
+|---|---|---|---|
+| Outside lane, flat cell before (`curve09i20`) | 99.8% | 0 | 0.2% (arm on the outer wall in the spike cell) |
+| ... the old sideways step (`strafe`), for comparison | 97.1% | 0 | 1.9% (18 of 19 in the corner cell) |
+| Inside lane, flat cell before (diagonal to the entry, `strafe`) | 99.6% | 0 | 0.4% (corner cell) |
+| **Spike lane before (inside) → corner → inside lane** (`strafe`) | 97.4% | **0.8%** | **1.2%** |
+| Spike lane before (outside) → corner → outside lane (`curve09i20`) | 98.6% | 0.4% | 1.0% |
+
+The last row's hits and falls were all before the corner, mostly right at the offset spawn point (boxes in the spawn
+cell): no failure at the corner. The inside → inside row is the only real problem found: 10 crashes as the robot enters
+the corner cell still 0.85-0.91 m toward the inside (the straight diagonal from the inside lane to the next lane's entry
+passes ~0.2 m from the end of the inner wall; 11 of 12 on right turns), and 8 spike hits at the near end of the next
+bed with the pelvis only 0.04-0.19 m on the lane side of the centreline after swinging wide (7 of 8 left turns; the
+cone shield was on in all 8). Curves for an inside lane (`curve07` / `curve09`) were worse (0.5 / 1.1% hits: they cut
+the corner and enter the spike cell ~0.3 m off the centreline). The cone shield did not cause the falls (same without
+it, 12.2 vs 13.1% in the first, mis-steered run-in version). Possible fix (not tried, would need the benchmark): from an
+inside spike lane, aim the diagonal clear of the inner wall's end before heading for the next lane's entry.
+
 ## 4. Gotchas learned the hard way
 
 - **Runs vary.** The same seed can differ by 50+ s. Never judge a change from one run.
@@ -1075,6 +1108,11 @@ most of a maze is spent at hazard caps, corners and turns on the spot (section 3
    cell 1 in 274. The most frequent fall left (L7 seed 2's (4, 3) is in the benchmark). Slowing the exit to 0.25 m/s
    was tried and reverted on 2026-11-11 (section 3, "Ice turns after a spike lane"); next: no pre-rotation before the
    ice (hold the corridor heading to the ice cell's decision), judged in the maze.
+
+0b. **Spike lane → rough corner → spike lane, both lanes on the inside** (L7 seed 4 random ends (4, 4), L9 seed 61
+   (7, 1)): ~2% of such corners fail in `G1-Corner-Test` (1.0% inner-wall crashes, 0.8% spike hits at the next bed's
+   near end); every other rough-corner / spike combination tested 0-0.4% at the corner (section 3, "Rough corners next
+   to spike cells").
 
 1. **Snags on rough floor** (a foot caught on a loose box): L7 seed 2 corner (3, 5) snags in every run, about 2 s,
    and sometimes falls. L9 seed 5 snags before its slalom. See item 7. **Lining up sideways at a rough corner before a

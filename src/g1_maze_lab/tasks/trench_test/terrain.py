@@ -224,6 +224,8 @@ def rough_corridor_terrain(difficulty: float, cfg: RoughCorridorTerrainCfg) -> t
         boxes.append((cx - hw - 0.5 * t, 0.5 * (cy + hw + sy), 0.5 * h, t, sy - cy - hw, h))  # West wall after it
         cells = [((i + 0.5) * c, cy) for i in range(int(cx // c) + 1)]
         cells += [(cx, cy + k * c) for k in range(1, int((sy - cy) // c) + 1)]
+        bare = [{"before": (cx - c, cy), "after": (cx, cy + c)}[b] for b in cfg.bare_cells]
+        cells = [p for p in cells if all(math.dist(p, q) > 0.5 * c for q in bare)]
     rng = np.random.default_rng(int(round(difficulty * 1e6)))  # Same boxes for the same generator seed
     inner = c - t - 0.3  # Box centres within +-inner/2 of the cell centre (hazard_maze.py)
     for px0, py0 in cells:
@@ -253,6 +255,7 @@ class RoughCorridorTerrainCfg(SubTerrainBaseCfg):
     boxes_per_cell: int = 10  # hazard_maze.py rough_boxes_per_cell
     box_height_range: tuple[float, float] = (0.02, 0.08)  # hazard_maze.py rough_height_range [m]
     spawn_clear: float = 0.5  # No box centre this close to the spawn point [m]
+    bare_cells: tuple[str, ...] = ()  # L cells left flat, "before" / "after" the corner (G1-Corner-Test's spike cells)
     corridor_half_width: float = 0.925  # [m]
     wall_thickness: float = 0.15  # [m]
     wall_height: float = 1.0  # [m]

@@ -1,11 +1,11 @@
 """Hazard test tasks: many G1 robots, each in a walled corridor (maze dimensions) with one hazard.
 
 ``G1-Trench-Test`` (a trench), ``G1-Ramp-Test`` (the maze's ramp), ``G1-Ice-Test`` (one cell of ice),
-``G1-Ice-Corner-Test`` (an L-shaped corridor turning at an ice cell), ``G1-Rough-Test`` (corridors of rough cells)
-and ``G1-Strafe-Test`` (open floor without walls). Same base config, observations and crash rule as
-the challenge's maze tasks (``tasks/maze/env_cfg.py``): a G1 Rough policy, commands written directly, and torso /
-pelvis / elbows / palms touching anything (floor or wall) ends the episode. ``scripts/trench_test.py`` and
-``scripts/ice_turn_test.py`` place the robots and drive them.
+``G1-Ice-Corner-Test`` (an L-shaped corridor turning at an ice cell), ``G1-Rough-Test`` (corridors of rough cells),
+``G1-Corner-Test`` (rough L corners between flat cells) and ``G1-Strafe-Test`` (open floor without walls). Same base
+config, observations and crash rule as the challenge's maze tasks (``tasks/maze/env_cfg.py``): a G1 Rough policy,
+commands written directly, and torso / pelvis / elbows / palms touching anything (floor or wall) ends the episode.
+``scripts/trench_test.py`` and ``scripts/ice_turn_test.py`` place the robots and drive them.
 """
 
 import isaaclab.terrains as terrain_gen
@@ -32,6 +32,7 @@ from .terrain import (
 )
 
 TILE_SIZE = (8.0, 3.0)  # Corridor tile: 8 m long (trench in the middle), 3 m wide (walls at +-1.0 m)
+CORNER_KINDS = ("left", "right")  # G1-Corner-Test rows
 NUM_COLS = 20  # Corridors per trench width
 
 
@@ -129,6 +130,22 @@ class G1RoughTestEnvCfg(G1TrenchTestEnvCfg):
         gen.num_cols = 25
         gen.seed = 1  # Same boxes in every run, so checkpoints are compared on the same floor
         gen.sub_terrains = {"rough_corridor": RoughCorridorTerrainCfg(proportion=1.0)}
+
+
+@configclass
+class G1CornerTestEnvCfg(G1RoughTestEnvCfg):
+    """Rough L corners only (rows: left / right turn); the cells before and after the corner cell are flat, as spike
+    cells are (``scripts/corner_lineup_test.py``)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        gen = self.scene.terrain.terrain_generator
+        gen.num_rows = len(CORNER_KINDS)
+        gen.sub_terrains = {
+            "rough_corridor": RoughCorridorTerrainCfg(
+                proportion=1.0, kinds=CORNER_KINDS, bare_cells=("before", "after")
+            )
+        }
 
 
 @configclass

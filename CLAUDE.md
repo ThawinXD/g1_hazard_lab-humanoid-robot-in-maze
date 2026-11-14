@@ -65,8 +65,10 @@ PYTHONIOENCODING=utf-8 uv run python scripts/rough_test.py --checkpoint <model.p
 PYTHONIOENCODING=utf-8 uv run python scripts/strafe_test.py --checkpoint <model.pt>
 ```
 
-Lining up for a spike lane right after a rough corner (lane on the outside of the turn), pilot.py's sideways step vs
-curves (`CORNER_MODES`, `CORNER_TIME`, `CORNER_REPEATS`; handoff.md §3 "Rough-corner line-up"):
+Spike lane right after a rough corner (`G1-Corner-Test`: cells before / after the corner flat), walked through the bed
+with challenge.py's spike rule: maneuvers (`CORNER_MODES`; pilot.py = `curve09i20` for an outside lane, `strafe` for an
+inside one), `CORNER_LANE` (outside / inside), `CORNER_RUNIN` (±0.48: a spike lane before the corner too),
+`CORNER_SHIELD`, `CORNER_TIME`, `CORNER_REPEATS`; handoff.md §3 "Rough corners next to spike cells":
 
 ```bash
 PYTHONIOENCODING=utf-8 uv run python scripts/corner_lineup_test.py --checkpoint <model.pt>
@@ -99,7 +101,7 @@ checkpoint with the trench / ramp / ice / rough / sideways tests against `model_
   `hazard_starter/` (`G1-Hazard-Starter`, `G1-Hazard-Pro`; training terrain has no walls) and `hazard_challenge/`
   (`G1-Hazard-Challenge`: maze ice through the hazard importer, `PilotLikeVelocityCommand`, `track_lin_vel_y_exp`).
   `trench_test/` holds the policy test tasks (`G1-Trench-Test`, `-Ramp-`, `-Ice-`, `-Ice-Corner-`, `-Rough-`,
-  `-Strafe-Test`).
+  `-Corner-`, `-Strafe-Test`).
 - **Friction:** Newton uses the larger friction of two touching shapes unless one has a higher `mjc:priority`, so
   slippery ground must be a separate prioritized mesh (as the maze's ice); lowering the feet's friction does nothing.
 - **Tests** `tests/`: simulator-free. `test_pilot_review.py` has a regression test per pilot fix with synthetic
